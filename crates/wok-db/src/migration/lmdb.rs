@@ -6,7 +6,7 @@
 //! performed. LMDB may update lock.mdb to register/release the reader slot.
 #![allow(unsafe_code)]
 
-use super::{LmdbSourceReport, LmdbTableInfo};
+use super::{LmdbSourceReport, LmdbTableInfo, SourceKind};
 use crate::comparators::{
     lmdb_comparator_string_u64, lmdb_comparator_string_u64_u64, lmdb_comparator_u64_u64,
 };
@@ -94,6 +94,9 @@ impl Drop for Source {
 }
 impl Source {
     pub fn open(path: &Path) -> Result<Self, DbError> {
+        Self::open_kind(path, SourceKind::Wok)
+    }
+    pub fn open_kind(path: &Path, kind: SourceKind) -> Result<Self, DbError> {
         if !cfg!(target_endian = "little") || std::mem::size_of::<usize>() != 8 {
             return Err(DbError::msg(
                 "LMDB migration requires a 64-bit little-endian host",
@@ -102,7 +105,7 @@ impl Source {
         let path = std::fs::canonicalize(path).map_err(|e| DbError::msg(e.to_string()))?;
         if !path.is_dir() || path.join("CURRENT").exists() {
             return Err(DbError::msg(
-                "source must be a Wok LMDB directory, not RocksDB",
+                "source must be an LMDB directory, not RocksDB",
             ));
         }
         let before = FileIdentity::read(&path.join("data.mdb"))?;
@@ -153,14 +156,25 @@ impl Source {
             .get(1, &1u64.to_ne_bytes())?
             .ok_or_else(|| DbError::msg("LMDB source has no Meta record"))?;
         let meta = decode_meta(raw)?;
-        if meta.db_version == wok_event::STRFRY_DB_VERSION {
-            return Err(DbError::msg("strfry v3 is not a Wok migration source; first run `wok migrate strfry` with an LMDB build"));
+        match kind {
+            SourceKind::Wok if !matches!(meta.db_version, 4 | 5) => {
+                return Err(DbError::msg(format!(
+                    "unsupported Wok LMDB version {} (expected 4 or 5; use `wok migrate strfry` for v3)",
+                    meta.db_version
+                )));
+            }
+            SourceKind::Strfry if meta.db_version != wok_event::STRFRY_DB_VERSION => {
+                return Err(DbError::msg(format!(
+                    "unsupported strfry LMDB version {} (expected 3)",
+                    meta.db_version
+                )));
+            }
+            _ => {}
         }
-        if !matches!(meta.db_version, 4 | 5) || meta.db_version > wok_event::WOK_DB_VERSION {
-            return Err(DbError::msg(format!(
-                "unsupported Wok LMDB version {} (expected 4 or 5)",
-                meta.db_version
-            )));
+        if kind == SourceKind::Strfry && source.report.tables[16..].iter().any(|t| t.present) {
+            return Err(DbError::msg(
+                "strfry v3 source contains Wok-owned tables; refusing mixed ownership",
+            ));
         }
         if meta.endianness != 1 {
             return Err(DbError::msg(
@@ -319,6 +333,38 @@ impl Source {
         check(rc)?;
         // SAFETY: successful mdb_get returned an MDB_val valid for this txn.
         Ok(Some(unsafe { slice(&value) }))
+    }
+    pub fn stats(&self) -> Result<crate::EnvironmentStats, DbError> {
+        // SAFETY: source owns this environment; LMDB fills both POD structs.
+        unsafe {
+            let mut info = std::mem::zeroed();
+            let mut stat = std::mem::zeroed();
+            check(mdb_env_info(self.env, &mut info))?;
+            check(mdb_env_stat(self.env, &mut stat))?;
+            Ok(crate::EnvironmentStats {
+                map_size: info.me_mapsize,
+                used_bytes: (info.me_last_pgno as u64 + 1) * stat.ms_psize as u64,
+                page_size: stat.ms_psize,
+                last_page_number: info.me_last_pgno,
+                entries: self.report.logical_records as usize,
+                readers: info.me_numreaders,
+                max_readers: info.me_maxreaders,
+            })
+        }
+    }
+    pub fn contains(&self, logical: u32, key: &[u8], value: &[u8]) -> Result<bool, DbError> {
+        let Some(dbi) = self.dbis[logical as usize - 1] else {
+            return Ok(false);
+        };
+        let cursor = Cursor::open(self, dbi)?;
+        let (mut key, mut value) = (val(key), val(value));
+        // SAFETY: the transaction and input buffers remain live for the call.
+        let rc = unsafe { mdb_cursor_get(cursor.cursor, &mut key, &mut value, MDB_GET_BOTH) };
+        if rc == MDB_NOTFOUND {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
     }
     pub fn check_unchanged(&self) -> Result<(), DbError> {
         if FileIdentity::read(&self.path.join("data.mdb"))? != self.before

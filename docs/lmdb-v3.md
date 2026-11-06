@@ -5,13 +5,16 @@ Derived from C++ `golpe.yaml` / generated `defaultDb.h` at strfry `9acdaeb1f6391
 Endianness: native (little-endian on supported hosts). An import source must
 have `Meta.endianness = 1` and `Meta.dbVersion = 3`.
 
-Wok never runs directly on that source. `wok migrate strfry` takes a read-only,
-transactionally consistent copy, verifies the copied records and each event
-against its payload (the packed fields, tags and expiration, the id and the
-signature), and changes the copy's `Meta.dbVersion` to Wok version 5. Version 4 introduced the ownership boundary;
-the first Wok format retains the v3 record layout to make migration lossless,
-but future Wok versions may evolve it. There is no implicit migration during
-normal `relay`, `info`, or database utility commands.
+Wok never runs directly on that source. `wok migrate strfry` reads a stopped
+registered LMDB snapshot, verifies its records and event signatures, and copies
+its logical tables into the current RocksDB layout. Exact local IDs, PackedEvent
+and encoded payload bytes survive; the destination Meta marker becomes Wok v5.
+There is no implicit migration during runtime opens. Wok LMDB v4/v5 uses the
+separate [full-state converter](migration-to-rocksdb.md).
+
+The tables and native-endian encodings below describe the LMDB import contract
+and Wok's logical schema. RocksDB uses its own ordered physical encodings,
+combined primary records and author frontiers; see [runtime storage](rocksdb-experimental.md).
 
 ## DBI names, flags, comparators
 
@@ -34,9 +37,9 @@ normal `relay`, `info`, or database utility commands.
 | `rasgueadb_defaultDb__CompressionDictionary` | INTEGERKEY | default | dictId | FlatBuffer dict |
 | `negentropy` | REVERSEKEY | default | treeId \|\| nodeId (native u64) | Node / MetaData |
 
-Import/open environment: `max_dbs=64`; named DBIs use their v3 creation flags
-on the private snapshot. Files Wok creates (`data.mdb`, `lock.mdb` and compact
-copies) get mode `0640`, less the umask; earlier releases used `0664`.
+Import environment: `max_dbs=64`; source DBI names, flags and comparators are
+validated without creating tables or opening a source write transaction. LMDB
+reader registration may update `lock.mdb`; authoritative `data.mdb` is unchanged.
 
 ## PackedEvent
 
@@ -249,15 +252,10 @@ finishes it in the background. Batches that find the index complete, a pass
 running, or a gap above a nonzero marker write their entries as above, and
 the import builds nothing.
 
-Neither happens while another process has the database open, as the LMDB
-reader table shows: a process takes a slot there with its first read, and a
-relay's writer reads as it starts. Batches then write their entries, because
-the writer would begin the pass after the first batch that left them out,
-every later batch would write them anyway, and the pass's end would leave
-those events to local-ID steps. The import checks again before each step of
-its pass and, once another process appears, leaves the rest to the relay. A
-process that has opened the database but not yet read from it holds no slot.
-Missing one costs only that extra work: the index ends the same.
+Runtime RocksDB has an exclusive writer-process lock. A separate importer
+cannot run beside the relay; stop the relay before import or maintenance.
+Earlier LMDB releases used the reader table to avoid scheduling the same
+backfill in two writer processes. That concurrency path is not a runtime mode.
 
 A batch never moves the marker past events whose entries it left out, and
 never changes a running pass's target: a pass covers exactly the events
@@ -359,7 +357,7 @@ records are retained with a warning, so one record cannot stop unrelated
 expiry and vanish cleanup. The progress step byte's high bit records that
 verification was incomplete; it disables the read shortcut, survives restart
 and raised cutoffs, and keeps retained records available to integrity/repair.
-LMDB errors still abort the transaction. After repairing damaged records,
+Storage errors still abort the transaction. After repairing damaged records,
 reindex drops progress and allows a new pass to verify the survivors again. Earlier releases' integrity
 check reports these keys as unknown.
 
@@ -376,11 +374,9 @@ expected after deletion. Integrity checks cannot distinguish a legitimately
 absent lazy key from an erased key, or prove the historical value of a lost
 sequence from a single snapshot. Preserve backups for that recovery case.
 
-`cargo test -p wok-db --lib crash_tests` exercises 43 forced process kills:
-three v4 upgrade boundaries, and five write boundaries for insertion,
-replacement, deletion, and mixed batches with both initialized and lazy state.
-The upgrade fixtures remove the state DBI entirely. Reopening read-only must
-show either the previous committed snapshot or the complete new snapshot;
-subsequent writes must allocate the expected next ID. Test-only checkpoints
-are absent from production builds. These are process-death tests before and
-after LMDB commit, not power-loss or torn-write simulations.
+`cargo test -p wok-db --lib crash_tests` exercises forced writer-process
+termination around transactional write boundaries. Read-only reopen must see a
+complete committed state, and subsequent writes must preserve local-ID
+allocation. Separate migration tests cover missing or malformed allocation
+state and v4 normalization. Test-only checkpoints are absent from production
+builds. These are process-death tests, not power-loss or torn-write simulations.

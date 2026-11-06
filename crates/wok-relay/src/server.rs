@@ -6872,7 +6872,14 @@ mod tests {
         handle
             .client_message(conn, local_source(), json!(["EVENT", note]).to_string())
             .await;
-        let reply = recv_outbound(&mut rx).await;
+        // The first quota lookup counts the 100,000-row fixture lazily. This
+        // checks admission, without imposing the small-fixture latency timeout
+        // on a debug build running on a shared CI host.
+        let reply = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("large-fixture admission timeout")
+            .expect("outbound closed")
+            .into_text();
         assert!(
             reply.starts_with(r#"["OK""#) && reply.contains("true"),
             "{reply}"

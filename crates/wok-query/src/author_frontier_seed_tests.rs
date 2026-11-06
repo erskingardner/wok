@@ -61,7 +61,7 @@ fn separate_parser_pairing_schema_and_readonly_closure_preserve_original_entry()
     assert_eq!(report["execution_limits"]["time_budget_us"], 0);
     assert_eq!(report["execution_limits"]["max_slices"], 64);
     let rows = report["records"].as_array().unwrap();
-    for pair in rows.chunks_exact(2) {
+    for pair in rows.as_chunks::<2>().0 {
         let pass = pair[0]["pass"].as_u64().unwrap();
         assert_eq!(
             pair[0]["arm"],

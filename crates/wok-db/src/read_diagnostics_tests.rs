@@ -28,70 +28,6 @@ fn database() -> (tempfile::TempDir, Env) {
 }
 
 #[test]
-#[cfg(not(feature = "rocksdb-coverless"))]
-fn native_calls_and_cover_copies_include_the_stopping_entry_and_reuse_cache() {
-    let (_dir, env) = database();
-    let tx = env.begin_ro().unwrap();
-    let key = make_key_string_u64(&[0; 32], u64::MAX);
-    let mut seen = Vec::new();
-    let (_, measured) = measure(|| {
-        let mut cursor = tx.cursor(env.covering_pubkey_dbi()).unwrap();
-        cursor
-            .foreach_index(&key, u64::MAX, |entry| {
-                seen.push(entry.local_id().unwrap());
-                if seen.len() == 2 {
-                    assert_eq!(entry.to_key(), make_key_string_u64(&[0; 32], 9));
-                    return false;
-                }
-                true
-            })
-            .unwrap();
-    })
-    .unwrap();
-    assert_eq!(seen, [12, 9]); // Interleaved local IDs, rather than one contiguous author.
-    let c = measured.wrapper;
-    assert_eq!((c.iterator_creations, c.seek, c.next), (1, 1, 1));
-    assert_eq!(
-        (c.seek_for_prev, c.prev, c.seek_to_first, c.seek_to_last),
-        (0, 0, 0, 0)
-    );
-    assert_eq!((c.typed_index_entries, c.fallback_index_entries), (2, 0));
-    assert_eq!((c.logical_decode_calls, c.arena_copy_bytes), (0, 0));
-    assert_eq!((c.resume_key_copies, c.resume_key_bytes), (1, 40));
-    assert_eq!((c.ordered_key_encodes, c.cover_records_copied), (1, 2));
-    assert_eq!(c.primary_pin_lookups, 0);
-    let record_bytes = seen
-        .iter()
-        .map(|id| {
-            tx.get_u64(env.dbis().event, *id).unwrap().unwrap().len()
-                + tx.get_u64(env.dbis().event_payload, *id)
-                    .unwrap()
-                    .unwrap()
-                    .len()
-                + 8
-        })
-        .sum::<usize>();
-    assert_eq!(c.cover_record_bytes_copied, record_bytes as u64);
-
-    let (_, cached) = measure(|| {
-        let mut cursor = tx.cursor(env.covering_pubkey_dbi()).unwrap();
-        cursor
-            .foreach_index(&key, u64::MAX, |entry| {
-                assert_eq!(entry.local_id().unwrap(), 12);
-                tx.get_u64(env.dbis().event, 12).unwrap().unwrap();
-                tx.get_u64(env.dbis().event_payload, 12).unwrap().unwrap();
-                false
-            })
-            .unwrap();
-    })
-    .unwrap();
-    assert_eq!(cached.wrapper.cover_records_copied, 0);
-    assert_eq!(cached.wrapper.cover_cached_owned_hits, 1);
-    assert_eq!(cached.wrapper.primary_cached_owned_hits, 2);
-    assert_eq!(cached.wrapper.primary_pin_lookups, 0);
-}
-
-#[test]
 fn primary_pins_are_shared_between_components_and_cover_does_not_copy_them() {
     let (_dir, env) = database();
     let tx = env.begin_ro().unwrap();
@@ -117,17 +53,14 @@ fn primary_pins_are_shared_between_components_and_cover_does_not_copy_them() {
         (2, 1, 1)
     );
     assert_eq!(c.primary_cached_pinned_hits, 1);
-    assert_eq!(
-        c.cover_cached_pinned_hits,
-        u64::from(!cfg!(feature = "rocksdb-coverless"))
-    );
+    assert_eq!(c.cover_cached_pinned_hits, u64::from(!true));
     assert_eq!(c.cover_records_copied, 0);
     let bytes = tx.get_u64(env.dbis().event, 12).unwrap().unwrap().len() + 7 + 8;
     assert_eq!(c.primary_pin_returned_bytes, bytes as u64);
 }
 
 #[test]
-#[cfg(feature = "rocksdb-coverless")]
+
 fn coverless_author_postings_do_not_populate_the_primary_cache() {
     let (_dir, env) = database();
     assert_eq!(env.covering_pubkey_dbi(), env.dbis().event_pubkey);

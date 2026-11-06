@@ -1,8 +1,8 @@
 # Wok
 
-Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). strfry v3 is a verified, one-way import format. Runtime databases are Wok-owned (v5 marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
+Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). RocksDB is the sole runtime. Wok LMDB v4/v5 and strfry v3 are read-only, one-way migration sources. Runtime databases are Wok-owned (v5 logical marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
 
-License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.85 (`rust-toolchain.toml` pins a newer stable for local builds).
+License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.88 (`rust-toolchain.toml` pins a newer stable for local builds).
 
 ## Layout
 
@@ -13,7 +13,7 @@ License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MS
 | `scripts/` | Release checks and benchmark campaign wrappers |
 | `contrib/` | Packaging extras (systemd unit) |
 | `fuzz/` | Separate cargo-fuzz workspace for untrusted-input targets |
-| `vendor/` | LMDB 0.9.37 source and the patched `lmdb-sys` that builds it |
+| `vendor/` | LMDB 0.9.37 source and patched `lmdb-sys` for read-only imports |
 | `.github/workflows/` | CI, fuzz, security, platforms, release |
 
 Generated or local-only: `target/`, `bench-results/`, `strfry-db/`, `fuzz/artifacts/`, `fuzz/corpus/`. Do not treat those as source.
@@ -30,7 +30,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 | Crate | Role |
 | --- | --- |
 | `wok-event` | Event JSON, NIP-01 hashing, Schnorr, PackedEvent |
-| `wok-db` | LMDB storage, v3 snapshot/import, indexes, integrity |
+| `wok-db` | RocksDB storage, read-only LMDB import, indexes, integrity |
 | `wok-query` | Filters, DBScan, QueryScheduler, live monitors |
 | `wok-negentropy` | NIP-77 protocol and persistent B-tree |
 | `wok-relay` | Transport-neutral dispatcher, AUTH, plugins, config |
@@ -42,13 +42,13 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 
 ## Invariants
 
-- Tokio owns network I/O only. LMDB transactions, cursors, and mmap slices must never cross `.await`.
-- One application-level LMDB writer; worker pools per stage (`numThreads.*`).
-- New databases use Wok v5. strfry v3 is accepted only by `wok migrate strfry`. Never mix writers.
+- Tokio owns network I/O only. Storage transactions, cursors, and borrowed records must never cross `.await`.
+- One application-level writer and an exclusive RocksDB writer-process lock; worker pools per stage (`numThreads.*`). Stop the relay before a separate mutating utility or checkpoint.
+- New databases use Wok v5 on RocksDB. strfry v3 is accepted only by `wok migrate strfry`; Wok LMDB v4/v5 only by `wok migrate rocksdb`. Never convert in place or mix writers.
 - Event identity (id, sig, tags, content, stored payload) is preserved across migration. Parsing and stored JSON go through `wok_event::json` (`parse_strict` / `to_tao_string`), not stock `serde_json`. Event ids use the NIP-01 preimage (`wok_event::event_id_hash`, U+007F verbatim); only paths that ingest stored events (import, sync, router) also accept the legacy tao preimage (`IdPreimage::Nip01OrLegacy`).
 - ID and author filters are exact 32-byte values. Prefix filters are rejected.
 - Advertise only NIPs with observable relay behavior and conformance coverage (`wok-relay` capabilities catalog).
-- Safe crates `forbid(unsafe_code)`. LMDB/OS FFI is isolated and documented (`wok-db` env/txn, `wok-cli` doctor/migrate, `wok-relay` rlimit).
+- Safe crates `forbid(unsafe_code)`. Native storage/OS FFI is isolated and documented (`wok-db` migration helpers, `wok-cli` doctor/migrate, `wok-relay` rlimit).
 
 Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` → lossless migration / event identity → pinned strfry as historical/differential reference.
 

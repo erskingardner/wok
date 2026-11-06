@@ -1,6 +1,6 @@
 # Architecture
 
-Tokio owns WebSocket and Unix I/O. Dedicated OS threads own LMDB.
+Tokio owns WebSocket and Unix I/O. Dedicated OS threads own RocksDB.
 
 ```
 clients ──WS──► wok-ws ──┐
@@ -17,7 +17,7 @@ Invariants:
 
 - strfry v3 is a read-only migration source; Wok runtime databases carry a
   Wok-owned version marker and are never shared with a strfry writer.
-- LMDB transactions, cursors, and mmap slices never cross `.await`.
+- Storage transactions, cursors, and borrowed records never cross `.await`.
 - A single application-level writer thread commits events, management changes and
   maintenance deletions together with counters and derived tree/index updates.
 - Connection-affine ingest, query, monitor and sync worker pools route by connection ID.
@@ -108,7 +108,7 @@ newest local event id splits the work: the history sends what was stored up
 to it, the live monitor everything stored or published after. Each event is
 the job of exactly one of them, so nothing is missed or sent twice, whatever
 the history's `limit` keeps out. That includes live-only (ephemeral) events,
-which never reach LMDB and so cannot be caught up later. No stage waits on
+which never reach storage and so cannot be caught up later. No stage waits on
 another along the way.
 
 ### The subscription gate
@@ -204,7 +204,7 @@ a REQ reusing an open id is charged only for the difference.
    committed during the scan (strfry sends those first). Held events are
    checked against the read policy again before they are sent.
    - Stored events after the snapshot that the buffer lacks are re-read from
-     LMDB after EOSE. That happens when the monitor matched commits past the
+     RocksDB after EOSE. That happens when the monitor matched commits past the
      snapshot before it saw `Register`, or when the stored part of the buffer
      outgrew `relay.max_live_buffer_bytes`.
    - Live-only events cannot be re-read. A full buffer drops the oldest and
@@ -241,10 +241,10 @@ The writer hands each commit's events to every monitor as one shared,
 immutable batch, so the monitors match them without reading them back. Each
 monitor still checks, in its own read transaction, that an event is stored
 and globally visible; only its search terms are worked out once, by the
-first monitor that needs them. A monitor reads the events from LMDB instead
+first monitor that needs them. A monitor reads the events from storage instead
 in these cases:
 
-- a database change from the file watcher, for commits by other processes;
+- a database change notification without an available writer commit batch;
 - a batch that does not follow on from what the monitor already matched;
 - a commit past the writer's hand-off budget (16 MiB of events that some
   monitor still holds), so a monitor that falls behind holds no more than
@@ -252,9 +252,9 @@ in these cases:
 
 ## Non-goals
 
-- Storage-backend independence is deferred. LMDB stays until a concrete backend
-  or operational requirement justifies an abstraction and a comparative benchmark.
+- RocksDB is the sole runtime backend; no runtime backend switch or shared
+  writers. Wok LMDB v4/v5 and strfry v3 are explicit read-only migration inputs.
 - No implicit strfry migration, production strfry mutation, or mixed writers.
-  Older Wok writers must be stopped before the v5 upgrade; rollback restores a
-  backup rather than lowering the marker. See [storage format](lmdb-v3.md).
+  Source writers must be stopped before offline migration; rollback after new
+  writes requires reconciliation, not just the old source or a lower marker. See [storage format](lmdb-v3.md).
 - No CBOR transport.

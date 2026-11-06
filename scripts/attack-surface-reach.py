@@ -41,7 +41,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PROFILES = ROOT / "crates/wok-compat/tests/profiles"
 BASELINE = ROOT / "crates/wok-compat/tests/reachability"
-TARGET = ROOT / "target/reachability"
+TARGET = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target/reachability")).resolve()
 RELAY_CRATES = re.compile(r"crates/wok-(relay|ws|unix|event|query|negentropy|db)/src/")
 PHASES = ["startup", "anonymous", "authenticated", "admin", "local"]
 # Background code that timers and file watchers run whenever they fire, not

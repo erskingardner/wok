@@ -387,7 +387,7 @@ async fn main() -> Result<()> {
     let mut author_live_deliveries = 0u64;
     while start.elapsed() < duration || !crash_recovered {
         let tick = Instant::now();
-        if round % 60 == 0 {
+        if round.is_multiple_of(60) {
             // Dedicated ephemeral pressure frames must never appear in the
             // durable model or on the unrelated fast subscription.
             let pressure: Vec<_> = (0..64)
@@ -433,7 +433,7 @@ async fn main() -> Result<()> {
             batch.push(e);
         }
         let mut removed: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        while round % DELETE_EVERY_ROUNDS == 0 && notes.len() > 256 {
+        while round.is_multiple_of(DELETE_EVERY_ROUNDS) && notes.len() > 256 {
             let (actor, id) = notes.pop_front().unwrap();
             model.remove(&id);
             removed.entry(actor).or_default().push(id);
@@ -464,7 +464,7 @@ async fn main() -> Result<()> {
             batch.push(e);
         }
         let mut removed_feed: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        while round % DELETE_EVERY_ROUNDS == 0 && feed_notes.len() > 64 {
+        while round.is_multiple_of(DELETE_EVERY_ROUNDS) && feed_notes.len() > 64 {
             let (actor, id) = feed_notes.pop_front().unwrap();
             model.remove(&id);
             removed_feed.entry(actor).or_default().push(id);
@@ -490,7 +490,7 @@ async fn main() -> Result<()> {
         }
         author_live_deliveries += (feed_batch.len() * connections.feed_readers.len()) as u64;
         receipts += batch.len() as u64;
-        if round % 15 == 0 {
+        if round.is_multiple_of(15) {
             for endpoint in endpoints {
                 history(endpoint, &model, &mut query_hist).await?;
                 author_feed(endpoint, &feed_authors, &model, &mut query_hist).await?;
@@ -498,7 +498,7 @@ async fn main() -> Result<()> {
             }
             sync_rounds += sync(endpoints[(round / 15) as usize % 2], &model).await?;
         }
-        if round > 0 && round % 60 == 0 {
+        if round > 0 && round.is_multiple_of(60) {
             connections.readers[0] = subscribe(endpoints[0], "soak").await?;
             connections.readers[1] = subscribe(endpoints[1], "soak").await?;
             for (i, wire) in connections.slow.iter_mut().enumerate() {
@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
             crash_recovered = true;
         }
         round += 1;
-        if round % 10 == 0 {
+        if round.is_multiple_of(10) {
             println!(
                 "{}",
                 json!({"phase":"mixed","seconds":start.elapsed().as_secs_f64(),"rounds":round,"receipts":receipts,"pressure_receipts":pressure_receipts,"stored":model.len(),"ack_p99_ms":ack_hist.value_at_quantile(0.99) as f64/1000.0,"ack_max_ms":ack_hist.max() as f64/1000.0,"query_p99_ms":query_hist.value_at_quantile(0.99) as f64/1000.0,"sync_rounds":sync_rounds,"slow_closes":slow_closes,"restarted":restarted,"crash_recovered":crash_recovered,"author_feed_checks":feed_checks})

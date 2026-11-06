@@ -20,7 +20,7 @@ enum Start {
 impl Start {
     fn scan(self, txn: &RoTxn<'_>, filter: &NostrFilter) -> DbScan {
         let mut scan = DbScan::new(filter, txn);
-        #[cfg(feature = "rocksdb-author-head-reads")]
+
         {
             // This independent diagnostic compares execution endpoints only.
             scan.author_head_reads = false;
@@ -48,9 +48,9 @@ fn event(n: u64, who: u64, created: u64, kind: u64, expiration: u64) -> EventToW
     id[..8].copy_from_slice(&n.to_be_bytes());
     let mut tags = PackedEventTagBuilder::default();
     tags.add('t', b"all").unwrap();
-    tags.add('t', if n % 2 == 0 { b"red" } else { b"blue" })
+    tags.add('t', if n.is_multiple_of(2) { b"red" } else { b"blue" })
         .unwrap();
-    if n % 5 == 0 {
+    if n.is_multiple_of(5) {
         tags.add('t', b"red").unwrap();
         tags.add('t', b"blue").unwrap();
     }
@@ -425,18 +425,7 @@ fn bounded_seek_retains_in_range_duplicate_errors_and_skips_unrequested_cover_da
                 assert!(direct.is_err());
             } else {
                 assert_eq!(direct.unwrap(), [events[0].lev_id]);
-                if thin
-                    || env.covering_pubkey_dbi() == env.dbis().event_pubkey
-                    || cfg!(feature = "rocksdb-thin-author-reads")
-                {
-                    assert_eq!(legacy.unwrap(), [events[0].lev_id]);
-                } else {
-                    // Rocks cover caching validates a duplicate before the
-                    // callback. Direct initialization intentionally does not
-                    // visit corrupt rows above until. Offline integrity, not
-                    // an unrelated bounded query, audits the full index.
-                    assert!(legacy.is_err());
-                }
+                assert_eq!(legacy.unwrap(), [events[0].lev_id]);
             }
         }
     }

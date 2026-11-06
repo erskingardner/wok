@@ -4,7 +4,6 @@
 //! paths, disk preflight, retained staging, the manifest, and publication.
 
 use anyhow::Result;
-#[cfg(feature = "rocksdb-author-heads")]
 use anyhow::{bail, Context};
 use clap::Args;
 use serde::Serialize;
@@ -50,14 +49,8 @@ impl Default for Execution {
 }
 
 pub fn run(options: Options) -> Result<()> {
-    #[allow(unused_mut)]
     let mut execution = Execution::default();
-    #[cfg(feature = "rocksdb-author-heads")]
     let result = enabled::execute(&options, &mut execution);
-    #[cfg(not(feature = "rocksdb-author-heads"))]
-    let result: Result<Value> = Err(anyhow::anyhow!(
-        "migrate rocksdb requires a RocksDB build: cargo build --release --locked -p wok-cli --features rocksdb"
-    ));
     match result {
         Ok(report) => emit(&report, options.json),
         Err(error) => {
@@ -68,7 +61,6 @@ pub fn run(options: Options) -> Result<()> {
                 "error":format!("{error:#}")
             });
             // A retained failure report is useful even when stdout is lost.
-            #[cfg(feature = "rocksdb-author-heads")]
             if let Some(staging) = &execution.staging_directory {
                 if let Err(save_error) =
                     enabled::write_json_new(&staging.join("failure.json"), &report)
@@ -108,7 +100,6 @@ fn emit(report: &Value, as_json: bool) -> Result<()> {
     }
 }
 
-#[cfg(feature = "rocksdb-author-heads")]
 mod enabled {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -376,34 +367,12 @@ mod tests {
                 json: false,
             })
             .unwrap_err();
-            #[cfg(feature = "rocksdb-author-heads")]
             assert!(format!("{error:#}").contains("valid UTF-8"));
-            #[cfg(not(feature = "rocksdb-author-heads"))]
-            assert!(format!("{error:#}").contains("--features rocksdb"));
             assert!(!output.exists());
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
-    #[cfg(not(feature = "rocksdb-author-heads"))]
-    #[test]
-    fn unavailable_backend_fails_without_creating_paths() {
-        let root = tempfile::tempdir().unwrap();
-        let output = root.path().join("new");
-        let error = run(Options {
-            source: root.path().join("missing"),
-            output: output.clone(),
-            confirm_relay_stopped: true,
-            check: false,
-            json: false,
-        })
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("--features rocksdb"));
-        assert!(!output.exists());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(feature = "rocksdb-author-heads")]
     #[allow(unsafe_code)]
     mod native {
         use super::*;

@@ -5,7 +5,7 @@
 //! allowed); data.mdb identity and the latest transaction are checked again
 //! before sealing. Every known logical table is copied, including opaque policy,
 //! dictionaries, negentropy nodes, sequence holes, and unfinished index/sweep
-//! progress. Only a v4 Meta version field is normalized to v5. No event is
+//! progress. Only a v3/v4 Meta version field is normalized to v5. No event is
 //! reimported, repacked, reindexed, or replayed through publication policy.
 //!
 //! The destination must not exist. Failures retain it; incomplete copies carry
@@ -59,7 +59,7 @@ impl Default for LmdbToRocksOptions {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct LmdbSourceReport {
     pub source: PathBuf,
     pub db_version: u64,
@@ -69,7 +69,7 @@ pub struct LmdbSourceReport {
     pub logical_records: u64,
     pub tables: Vec<LmdbTableInfo>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LmdbTableInfo {
     pub name: String,
     pub present: bool,
@@ -85,7 +85,7 @@ pub struct LmdbTableVerification {
     pub key_bytes: u64,
     pub value_bytes: u64,
     pub source_sha256: String,
-    /// Equals source_sha256 except for the explicitly reported v4 Meta upgrade.
+    /// Equals source_sha256 except for the explicitly reported Meta upgrade.
     pub expected_target_sha256: String,
     pub target_sha256: String,
 }
@@ -121,7 +121,139 @@ pub fn migrate_lmdb_to_rocksdb(
     destination: &Path,
     options: &LmdbToRocksOptions,
 ) -> Result<LmdbToRocksReport, DbError> {
-    migrate(source, destination, options, Fault::None)
+    migrate_kind(source, destination, options, Fault::None, SourceKind::Wok)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Wok,
+    Strfry,
+}
+
+/// Inspect an unmodified strfry v3 source without a runtime database open.
+/// This registers an LMDB reader; lock.mdb coordination may change.
+pub fn inspect_strfry_source(path: &Path) -> Result<LmdbSourceReport, DbError> {
+    Ok(lmdb::Source::open_kind(path, SourceKind::Strfry)?
+        .report
+        .clone())
+}
+
+/// Direct, lossless import of a stopped strfry v3 source. All sixteen native
+/// logical tables are retained; only Meta's version scalar is normalized.
+/// Wok extension tables start empty/lazy. No writable LMDB intermediate exists.
+/// Destination, bounded-memory, failure and publication rules are identical to
+/// [`migrate_lmdb_to_rocksdb`].
+pub fn migrate_strfry_to_rocksdb(
+    source: &Path,
+    destination: &Path,
+    options: &LmdbToRocksOptions,
+) -> Result<LmdbToRocksReport, DbError> {
+    migrate_kind(
+        source,
+        destination,
+        options,
+        Fault::None,
+        SourceKind::Strfry,
+    )
+}
+
+#[path = "strfry.rs"]
+mod strfry;
+pub use strfry::{audit_strfry_source, StrfrySourceAudit};
+
+/// Full stored-event verification without a transaction arena or a population-
+/// sized dictionary cache. Intended for offline conversion validation.
+pub fn verify_rocksdb_events_bounded(env: &Env) -> Result<crate::EventFingerprint, DbError> {
+    let (count, sha256) = verify_primaries(env, &LmdbToRocksOptions::default())?;
+    Ok(crate::EventFingerprint { count, sha256 })
+}
+
+/// Seed derived replacement bookkeeping in a fresh, verified strfry import.
+/// The caller must retain exclusive ownership of the private destination and
+/// pass the successful source audit used for its copy preflight. All six Wok
+/// extension tables must still be empty, including State: even an existing zero
+/// counter is refused. This is a one-time migration operation, not a setter for
+/// arbitrary runtime state. The sixteen imported tables are never rewritten.
+///
+/// Seed before `Env::ensure_initialized`: otherwise its legacy replacement
+/// counting scan retains generic cursor allocations for the entire index.
+pub fn initialize_strfry_derived_state(
+    env: &Env,
+    copied: &LmdbToRocksReport,
+    audit: &StrfrySourceAudit,
+) -> Result<(), DbError> {
+    let specs = crate::dbi_specs();
+    if !copied.verified
+        || !copied.sealed
+        || !copied.source_unchanged
+        || !copied.meta_version_normalized
+        || copied.source.db_version != wok_event::STRFRY_DB_VERSION
+        || copied.source.target_db_version != wok_event::WOK_DB_VERSION
+        || copied.source != audit.source
+        || copied.destination != env.inner.path
+        || copied.target_layout != String::from_utf8_lossy(FORMAT)
+        || copied.verified_events != audit.fingerprint.count
+        || copied.primary_fingerprint_sha256 != hex(audit.fingerprint.sha256)
+        || audit.integrity.events != copied.verified_events
+        || audit.integrity.superseded_events > copied.verified_events
+        || !audit.integrity.ok()
+        || !audit
+            .event_verification
+            .as_ref()
+            .is_some_and(|v| v.ok() && v.events == copied.verified_events)
+        || copied.source.tables.len() != specs.len()
+        || copied.tables.len() != specs.len()
+    {
+        return Err(failure(
+            "derived initialization requires matching verified strfry copy and source audit",
+        ));
+    }
+    for (index, spec) in specs.iter().enumerate() {
+        let source = &copied.source.tables[index];
+        let table = &copied.tables[index];
+        if source.name != spec.name
+            || table.name != spec.name
+            || source.present != (index < 16)
+            || table.source_present != source.present
+            || table.records != source.records
+            || table.target_sha256 != table.expected_target_sha256
+            || (index != 0 && table.source_sha256 != table.target_sha256)
+        {
+            return Err(failure(
+                "derived initialization requires exact native source-table verification",
+            ));
+        }
+    }
+    // Hold the application writer lock across all freshness checks and the
+    // single bounded state write. entries() reads persisted scalar counts;
+    // neither this check nor Meta lookup scans/retains primary/index rows.
+    let mut txn = env.begin_rw()?;
+    let raw = txn
+        .get_u64(env.dbis().meta, 1)?
+        .ok_or_else(|| failure("derived initialization requires Meta"))?;
+    let meta = crate::decode_meta(raw)?;
+    if meta.db_version != wok_event::WOK_DB_VERSION || meta.endianness != 1 {
+        return Err(failure("derived initialization requires current Wok Meta"));
+    }
+    for (index, table) in copied.tables.iter().enumerate() {
+        let entries = txn.entries(index as u32 + 1)? as u64;
+        if (index < 16 && entries != table.records) || (index >= 16 && entries != 0) {
+            return Err(failure("derived initialization requires untouched native counts and empty Wok extension tables"));
+        }
+    }
+    let state = env
+        .dbis()
+        .state
+        .ok_or_else(|| failure("derived initialization requires State"))?;
+    if !txn.put(
+        state,
+        crate::state::SUPERSEDED_EVENTS,
+        &audit.integrity.superseded_events.to_le_bytes(),
+        lmdb_sys::MDB_NOOVERWRITE,
+    )? {
+        return Err(failure("derived replacement count already exists"));
+    }
+    txn.commit()
 }
 
 fn failure(label: &str) -> DbError {
@@ -248,7 +380,7 @@ fn validate_row(
 // than rebuilding the FlatBuffer (which would discard padding/unknown fields).
 fn normalize_meta(raw: &[u8]) -> Result<Vec<u8>, DbError> {
     let meta = crate::decode_meta(raw)?;
-    if meta.db_version != 4 {
+    if !matches!(meta.db_version, 3 | 4) {
         return Ok(raw.to_vec());
     }
     let root = u32::from_le_bytes(
@@ -456,11 +588,22 @@ fn destination_path(source: &Path, destination: &Path) -> Result<PathBuf, DbErro
     Ok(destination)
 }
 
+#[cfg(test)]
 fn migrate(
     source: &Path,
     destination: &Path,
     options: &LmdbToRocksOptions,
     fault: Fault,
+) -> Result<LmdbToRocksReport, DbError> {
+    migrate_kind(source, destination, options, fault, SourceKind::Wok)
+}
+
+fn migrate_kind(
+    source: &Path,
+    destination: &Path,
+    options: &LmdbToRocksOptions,
+    fault: Fault,
+    kind: SourceKind,
 ) -> Result<LmdbToRocksReport, DbError> {
     if options.batch_bytes == 0
         || options.batch_bytes > MAX_BATCH_BYTES
@@ -471,7 +614,15 @@ fn migrate(
     {
         return Err(failure("invalid bounded migration options"));
     }
-    let source = lmdb::Source::open(source)?;
+    let source = lmdb::Source::open_kind(source, kind)?;
+    if kind == SourceKind::Strfry {
+        let audit = strfry::audit(&source, true, options)?;
+        if !audit.integrity.ok() || !audit.event_verification.as_ref().is_some_and(|v| v.ok()) {
+            return Err(failure(
+                "strfry source failed integrity/signature/body verification",
+            ));
+        }
+    }
     let destination = destination_path(&source.report.source, destination)?;
     let destination = destination.as_path();
     let env = new_pending(destination)?;
@@ -517,7 +668,9 @@ fn migrate(
                         expected[14].row(key, payload)?;
                         expected[2].row(key, value)?;
                         batches.primary(key, value, payload)?;
-                    } else if dbi == 1 && key == 1u64.to_ne_bytes() && source.report.db_version == 4
+                    } else if dbi == 1
+                        && key == 1u64.to_ne_bytes()
+                        && source.report.db_version < wok_event::WOK_DB_VERSION
                     {
                         let normalized = normalize_meta(value)?;
                         expected[0].row(key, &normalized)?;
@@ -595,7 +748,6 @@ fn migrate(
             "thin author index is not bijective with primary records",
         ));
     }
-    #[cfg(feature = "rocksdb-author-heads")]
     verify_heads(&env)?;
     env.check_background_errors()?;
     drop(env);
@@ -609,8 +761,8 @@ fn migrate(
         tables,
         commits,
         verified_events,
-        primary_fingerprint_sha256,
-        meta_version_normalized: source.report.db_version == 4,
+        primary_fingerprint_sha256: hex(primary_fingerprint_sha256),
+        meta_version_normalized: source.report.db_version < wok_event::WOK_DB_VERSION,
         source_unchanged: true,
         verified: true,
         sealed: true,
@@ -718,7 +870,7 @@ fn validate_physical_row(
     Ok(())
 }
 
-fn verify_primaries(env: &Env, options: &LmdbToRocksOptions) -> Result<(u64, String), DbError> {
+fn verify_primaries(env: &Env, options: &LmdbToRocksOptions) -> Result<(u64, [u8; 32]), DbError> {
     let db = &env.inner.db;
     let primary = db
         .cf_handle(COMBINED)
@@ -760,7 +912,6 @@ fn verify_primaries(env: &Env, options: &LmdbToRocksOptions) -> Result<(u64, Str
         {
             return Err(failure("primary has no exact thin author posting"));
         }
-        #[cfg(feature = "rocksdb-author-heads")]
         {
             let cf = db
                 .cf_handle(crate::rocks::HEAD_CF)
@@ -834,10 +985,9 @@ fn verify_primaries(env: &Env, options: &LmdbToRocksOptions) -> Result<(u64, Str
         it.next();
     }
     it.status().map_err(native)?;
-    Ok((count, hex(digest.finalize())))
+    Ok((count, digest.finalize().into()))
 }
 
-#[cfg(feature = "rocksdb-author-heads")]
 fn verify_heads(env: &Env) -> Result<(), DbError> {
     let db = &env.inner.db;
     let cf = db

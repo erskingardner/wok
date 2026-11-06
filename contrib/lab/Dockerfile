@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.99.0-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_BUILD_JOBS=2
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
@@ -7,7 +10,7 @@ COPY vendor vendor
 RUN cargo build --release --locked -p wok-cli -p wok-bench
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl python3 libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data /results && chown 10001:10001 /data /results
 COPY --from=build /src/target/release/wok /src/target/release/wok-bench /usr/local/bin/

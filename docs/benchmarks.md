@@ -1054,9 +1054,10 @@ history.
 Per step the table gives those counts, transactions, stored events per
 second and µs per stored event, transaction time (from `begin_rw` to the
 end of the commit) and commit time at p50 and p99, the growth of
-`data.mdb` for LMDB or all native database files for RocksDB, and the events the
+all native database files for RocksDB, and the events the
 search build indexed and its time. The report identifies its compiled storage
 backend and size scope; RocksDB is sampled without forcing flush or compaction.
+Historical LMDB reports counted `data.mdb`; the current runtime has no LMDB selector.
 On Linux it also gives the bytes the process wrote per stored
 event and the 4 KiB pages per commit, from `write_bytes` in
 `/proc/self/io`. The page column is 4 KiB equivalents; RocksDB bytes also include
@@ -1164,7 +1165,7 @@ filesystem, transparent huge pages, swap and network interfaces. Then it
 measures:
 
 - on the relay's database filesystem: 4 KiB writes with `fdatasync`, which
-  every LMDB commit waits on, and 4 KiB direct random reads at depth 1 and
+  every synchronous storage commit waits on, and 4 KiB direct random reads at depth 1 and
   4×32. They run in a new `qualify.XXXXXX` directory under `DISK_DIR` (default
   `/var/lib/relay-bench`), and only that directory is removed afterwards;
 - between the hosts, from the load host to `RELAY_HOST`: ping, and iperf3 with
@@ -1472,7 +1473,7 @@ See [NIP-50 search](nip50-search.md) for the search workload and exact semantics
 
 The harness defaults to `--tcp-nodelay true` and records this setting in every
 result row. Use explicit true/false runs on the same Linux host before attributing
-WebSocket request plateaus to the codec, LMDB, or Nagle.
+WebSocket request plateaus to the codec, storage, or Nagle.
 
 The mixed read/write scenario queries a fixed corpus author while distinct
 authors publish, allowing an exact historical oracle despite concurrent commits.
@@ -1580,7 +1581,7 @@ time the REQ path the way clients use it. Like `eose_latency.rs`, they drive an
 in-process relay through the public `RelayHandle` API, so the same file runs
 unchanged against older revisions. The relay has default limits, with abuse
 controls and AUTH off. Its corpus of kind-1 events is written straight to
-LMDB before it starts.
+RocksDB before it starts.
 
 ```bash
 cargo test --release -p wok-compat --test req_path_latency -- \

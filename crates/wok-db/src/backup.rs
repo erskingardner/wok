@@ -107,7 +107,7 @@ pub(crate) fn create(
     let mut published = false;
     let outcome: Result<(), DbError> = (|| {
         write(&database)?;
-        fs::set_permissions(&database, fs::Permissions::from_mode(0o750)).map_err(convert)?;
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o700)).map_err(convert)?;
         sync_tree(&database).map_err(convert)?;
         promote_directory_noreplace(&database, &output)?;
         published = true;

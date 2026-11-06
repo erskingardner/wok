@@ -7,18 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0-rc.1] - 2026-11-06
+
+### Changed
+
+- RocksDB is the sole runtime and ordinary build. LMDB is read-only import
+  support for Wok v4/v5 and strfry v3; runtime/layout build selectors are removed.
+  The verified v3 RocksDB format and its historical storage identity are retained.
+- Rust 1.88 is the minimum. Releases produce one native archive per target;
+  release-candidate tags publish as prereleases without replacing latest stable.
+- The LMDB-only `compact <file>` command is removed; use
+  `wok backup --output <new-directory>` for a native checkpoint.
+- Stop the relay before separate imports, maintenance or checkpoints: RocksDB
+  takes an exclusive writer-process lock. New native directories are private and
+  writable opens strip other-user access. Legacy LMDB configuration keys remain
+  accepted but do not tune RocksDB.
+
 ### Added
 
-- Optional `--features rocksdb` builds and separate RocksDB release assets;
-  LMDB remains the default. `wok storage-backend` identifies the binary without
-  opening a database, and `doctor` reports backend-appropriate storage health.
+- `wok storage-backend` identifies the runtime without opening a database;
+  `doctor` reports native storage health and free space.
 - `wok migrate rocksdb` performs an offline, verified full-state copy from Wok
   LMDB v4/v5 into a new RocksDB directory, preserving local IDs, encoded payloads
   and administrative state. It retains the source and failed staging, publishes
   without replacing an existing path, and provides `--check` and JSON outcomes.
-- `wok backup --output <new-directory>` creates an LMDB compact snapshot or a
-  native RocksDB checkpoint. RocksDB requires the relay to be stopped. Operator
-  guidance covers binary selection, migration, verification and rollback limits.
+- `wok backup --output <new-directory>` creates a native RocksDB checkpoint
+  without replacing a path. Operator guidance covers migration, verification,
+  source preservation and rollback limits after new writes.
 - NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
   events signed with `["no_delete"]` survive their author's kind-5 deletion
   and kind-62 purge requests, regardless of arrival order or republication.
@@ -90,9 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a recipient, address, deletion target or expiry its author did not sign,
   or not signed at all. A source holding such an event is refused, and up to
   100 of them are named by local ID, id and reason; `--check` reports the
-  same. Verification spreads over every core, or half of them for `--check`,
-  which may run beside strfry: a million events took about 4 s on a 14-core
-  Apple M4 Max.
+  same. Verification streams in bounded memory. `--check` creates no destination;
+  stop strfry and every other source writer before checking and keep them stopped
+  through the copy.
 - A file that gives a kind more readers than its preset does is warned about
   when the relay starts, and by `wok doctor` in a new `read-classes` check
   (#163). `relay.auth.recipient_only_kinds = []`, `owner_only_kinds = []` or
@@ -481,17 +496,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add separate opt-in RocksDB author-frontier layout and read features. The
-  layout keeps each author's newest two positions in a derived column family;
-  the reader initializes wide pure-author scans with snapshot-bound native
-  batches of at most 32 keys. Ordinary range refills and bounded completeness
-  checks retain their existing path. The format requires a separate database,
-  with no converter or default change.
-- Add an opt-in `rocksdb-coverless` physical layout for isolated experiments.
-  It keeps the combined primary bytes and thin author reads, omits the full
-  covering author index and its maintenance, and uses a distinct marker and
-  column family set. Existing layouts are refused before a writable open;
-  no database conversion or default change is included.
+- Author frontiers store each author's newest two positions atomically with
+  thin postings. Wide pure-author scans initialize from snapshot-bound point
+  batches of 32, preserve exact resume lookahead and use ordinary seeks for
+  completeness peeks and unusable frontiers.
+- Runtime RocksDB keeps combined primary/payload records and thin author
+  postings without the former full author covering index. Older experimental
+  physical layouts remain incompatible and are refused explicitly.
 - `wok-bench --scenario db_write` times storing events without a relay or
   the network (#257). It loads a corpus into a fresh database, then writes
   the corpus's last events through the relay writer's storage calls in

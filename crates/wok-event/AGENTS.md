@@ -2,7 +2,7 @@
 
 Leaf crate: Nostr event JSON, NIP-01 id hashing, Schnorr verification, PackedEvent, and kind helpers. `#![forbid(unsafe_code)]`.
 
-Byte layouts and validation follow pinned strfry for migration/event-identity, but protocol semantics follow the NIPs. Database version constants live here: strfry import `STRFRY_DB_VERSION = 3`, Wok-owned `WOK_DB_VERSION = 4`.
+Byte layouts and validation follow pinned strfry for migration/event-identity, but protocol semantics follow the NIPs. Database version constants live here: strfry import `STRFRY_DB_VERSION = 3`, Wok-owned `WOK_DB_VERSION = 5`.
 
 ## Layout
 

@@ -52,33 +52,44 @@ fn strfry_import(conf: &Path, events: &[Value]) {
 }
 
 #[test]
-fn cpp_refuses_wok_owned_database() {
-    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
-        eprintln!("skip: strfry binary missing at {}", strfry_bin().display());
+fn cpp_export_matches_direct_import() {
+    if !strfry_available() {
         return;
     }
-    let (dir, env) = temp_db();
-    let ev = sign_event(json!({
-        "created_at": 1_700_000_000u64,
-        "kind": 1,
-        "tags": [],
-        "content": "compat-hello",
-    }));
-    write_event_to_env(&env, &ev);
-    drop(env);
-    let conf = write_conf(dir.path());
-    let out = strfry_cmd(&conf, &["export"]);
-    assert!(
-        !out.status.success(),
-        "strfry unexpectedly opened Wok v4: status={:?} stderr={} stdout={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr),
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!(
-        "Database version too new: {}",
-        wok_event::WOK_DB_VERSION
-    )));
+    let source = tempfile::tempdir().unwrap();
+    let conf = write_conf(source.path());
+    assert!(strfry_cmd(&conf, &["info"]).status.success());
+    let event = sign_event(json!({"created_at":1_700_000_000u64,"kind":1,
+        "tags":[["t","migration"]],"content":"compat-hello"}));
+    strfry_import(&conf, std::slice::from_ref(&event));
+    let exported = strfry_cmd(&conf, &["export"]);
+    assert!(exported.status.success());
+    let exported =
+        wok_event::json::parse_strict(std::str::from_utf8(&exported.stdout).unwrap().trim())
+            .unwrap();
+    let output =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let report = wok_db::migrate_strfry_to_rocksdb(
+        source.path(),
+        &output.path().join("db"),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.verified_events, 1);
+    let env = Env::open(output.path().join("db"), EnvOptions::for_tests()).unwrap();
+    let txn = env.begin_ro().unwrap();
+    let mut decomp = Decompressor::new();
+    let mut actual = Vec::new();
+    wok_db::foreach_event_from(&txn, 0, |id, _| {
+        actual.push(
+            wok_event::json::parse_strict(&event_json_owned(&txn, &mut decomp, id, 65536).unwrap())
+                .unwrap(),
+        );
+        true
+    })
+    .unwrap();
+    assert_eq!(actual, [exported]);
+    assert_eq!(actual[0], event);
 }
 
 #[test]
@@ -106,7 +117,7 @@ fn rust_open_own_db_and_scan() {
 
 #[test]
 fn cpp_write_rust_read_query() {
-    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
+    if !strfry_available() {
         eprintln!("skip: strfry binary missing");
         return;
     }
@@ -121,8 +132,11 @@ fn cpp_write_rust_read_query() {
         "content": "from-cpp",
     }));
     strfry_import(&conf, std::slice::from_ref(&ev));
-    let env = Env::open(db, EnvOptions::for_tests()).unwrap();
-    assert_eq!(env.db_version().unwrap(), 3);
+    let output =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    wok_db::migrate_strfry_to_rocksdb(db, &output.path().join("db"), &Default::default()).unwrap();
+    let env = Env::open(output.path().join("db"), EnvOptions::for_tests()).unwrap();
+    assert_eq!(env.db_version().unwrap(), wok_event::WOK_DB_VERSION);
     let txn = env.begin_ro().unwrap();
     let mut decomp = Decompressor::new();
     let mut ids = Vec::new();
@@ -210,30 +224,22 @@ fn wok_delete_removes_event_from_queries() {
 }
 
 #[test]
-fn strfry_v3_database_is_read_only_to_wok() {
-    if wok_db::storage_backend_name() != "lmdb" || !strfry_available() {
+fn strfry_v3_database_requires_explicit_import() {
+    if !strfry_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path();
-    let conf = write_conf(db);
-    let _ = strfry_cmd(&conf, &["info"]);
-    let a = sign_event(json!({
-        "created_at": 1_700_000_400u64,
-        "kind": 1,
-        "tags": [],
-        "content": "cpp-a",
-    }));
-    strfry_import(&conf, &[a]);
-    let env = Env::open(db, EnvOptions::for_tests()).unwrap();
-    let error = match env.begin_rw() {
-        Ok(_) => panic!("Wok unexpectedly opened a write transaction on strfry v3"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("import source and is read-only"));
-    let txn = env.begin_ro().unwrap();
-    let report = check_integrity(&txn).unwrap();
-    assert!(report.ok(), "{report:?}");
+    let conf = write_conf(dir.path());
+    assert!(strfry_cmd(&conf, &["info"]).status.success());
+    let before = std::fs::read(dir.path().join("data.mdb")).unwrap();
+    assert!(Env::open(dir.path(), EnvOptions::for_tests()).is_err());
+    assert_eq!(std::fs::read(dir.path().join("data.mdb")).unwrap(), before);
+    assert_eq!(
+        wok_db::inspect_strfry_source(dir.path())
+            .unwrap()
+            .db_version,
+        3
+    );
 }
 
 #[test]

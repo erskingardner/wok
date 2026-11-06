@@ -194,11 +194,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         CheckStatus::Pass,
         wok_db::storage_backend_name(),
     );
-    let database_files: &[&str] = if cfg!(feature = "rocksdb-backend") {
-        &["CURRENT"]
-    } else {
-        &["data.mdb", "lock.mdb"]
-    };
+    let database_files: &[&str] = &["CURRENT"];
     for filename in database_files {
         let path = cfg.db.join(filename);
         report.add(
@@ -292,40 +288,13 @@ pub fn run(cfg: &Config, config_path: &Path) -> DoctorReport {
         Err(error) => report.add("database-meta", CheckStatus::Fail, error.to_string()),
     }
 
-    let storage_check = if cfg!(feature = "rocksdb-backend") {
-        "rocksdb-storage"
-    } else {
-        "lmdb-map"
-    };
+    let storage_check = "rocksdb-storage";
     match env.stats() {
-        Ok(stats) if cfg!(feature = "rocksdb-backend") => {
+        Ok(stats) => {
             report.add(
                 storage_check,
                 CheckStatus::Pass,
                 format!("{} bytes in native database files", stats.used_bytes),
-            );
-            report.database = Some(stats);
-        }
-        Ok(stats) => {
-            let utilization = if stats.map_size == 0 {
-                100.0
-            } else {
-                stats.used_bytes as f64 * 100.0 / stats.map_size as f64
-            };
-            let status = if utilization >= 90.0 {
-                CheckStatus::Fail
-            } else if utilization >= 75.0 {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Pass
-            };
-            report.add(
-                storage_check,
-                status,
-                format!(
-                    "{} of {} bytes used ({utilization:.1}%)",
-                    stats.used_bytes, stats.map_size
-                ),
             );
             report.database = Some(stats);
         }

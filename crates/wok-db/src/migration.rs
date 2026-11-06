@@ -1,21 +1,12 @@
-//! Read-only snapshot and verification helpers for strfry migration.
+//! Stored-event verification and fingerprints for RocksDB databases.
 
-#![allow(unsafe_code)]
+#![forbid(unsafe_code)]
 
-use crate::env::{create_copy_file, DB_FILE_MODE};
-use crate::{foreach_event_from, DbError, Decompressor, Env, EnvOptions, RoTxn};
-use lmdb_sys::{
-    mdb_env_close, mdb_env_copyfd2, mdb_env_create, mdb_env_open, mode_t, MDB_CP_COMPACT,
-    MDB_NORDAHEAD, MDB_RDONLY, MDB_READERS_FULL,
-};
+use crate::{foreach_event_from, DbError, Decompressor, Env, RoTxn};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::ffi::CString;
-use std::os::unix::io::AsRawFd;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
-use std::ptr;
 use std::sync::{Mutex, PoisonError};
 use wok_event::PackedEventView;
 
@@ -26,47 +17,10 @@ const VERIFY_RUN: u64 = 4096;
 /// Largest payload JSON decoded, as integrity decodes it.
 const MAX_PAYLOAD_JSON: usize = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventFingerprint {
     pub count: u64,
     pub sha256: [u8; 32],
-}
-
-/// Take a transactionally consistent compact copy without opening any write
-/// transaction against the source environment.
-pub fn snapshot_lmdb_readonly(
-    source: &Path,
-    destination: &Path,
-    no_read_ahead: bool,
-) -> Result<(), DbError> {
-    if destination.exists() {
-        return Err(DbError::msg(format!(
-            "snapshot destination '{}' already exists",
-            destination.display()
-        )));
-    }
-    std::fs::create_dir_all(destination).map_err(|e| DbError::msg(e.to_string()))?;
-
-    let source = CString::new(source.to_string_lossy().as_bytes())
-        .map_err(|_| DbError::msg("source DB path contains NUL"))?;
-
-    let mut raw_env = ptr::null_mut();
-    let result = (|| {
-        crate::error::check(unsafe { mdb_env_create(&mut raw_env) })?;
-        let mut flags = MDB_RDONLY;
-        if no_read_ahead {
-            flags |= MDB_NORDAHEAD;
-        }
-        crate::error::check(unsafe {
-            mdb_env_open(raw_env, source.as_ptr(), flags, DB_FILE_MODE as mode_t)
-        })?;
-        let copy = create_copy_file(&destination.join("data.mdb"))?;
-        crate::error::check(unsafe { mdb_env_copyfd2(raw_env, copy.as_raw_fd(), MDB_CP_COMPACT) })
-    })();
-    if !raw_env.is_null() {
-        unsafe { mdb_env_close(raw_env) };
-    }
-    result
 }
 
 /// Hash the complete logical event records without decompressing or
@@ -185,15 +139,15 @@ impl EventVerificationReport {
 ///
 /// Up to `threads` workers, the calling thread among them, each open one
 /// read transaction and take runs of local ids from a shared counter. Each
-/// holds an LMDB reader slot, so no more are started than the environment
-/// has slots never used. On a database being written, events stored after
-/// the call begins may be skipped.
+/// uses its own RocksDB snapshot. On a database being written, events stored
+/// after the call begins may be skipped; use the offline migration API for a
+/// single immutable source snapshot and bounded conversion validation.
 pub fn verify_events(env: &Env, threads: usize) -> Result<EventVerificationReport, DbError> {
     let runs = Runs {
         next: Mutex::new(Some(0)),
         largest: env.begin_ro()?.largest_integer_key(env.dbis().event)?,
     };
-    // The calling thread holds a slot now, and verifies too.
+    // Retain the configured worker budget; the calling thread verifies too.
     let stats = env.stats()?;
     let spare = stats.max_readers.saturating_sub(stats.readers) as usize;
     let spawned = threads.saturating_sub(1).min(spare);
@@ -259,12 +213,7 @@ impl Runs {
 }
 
 fn verify_runs(env: &Env, runs: &Runs) -> Result<EventVerificationReport, DbError> {
-    let txn = match env.begin_ro() {
-        Ok(txn) => txn,
-        // Another process took the slot; the other workers take the runs.
-        Err(DbError::Lmdb(MDB_READERS_FULL, _)) => return Ok(EventVerificationReport::default()),
-        Err(error) => return Err(error),
-    };
+    let txn = env.begin_ro()?;
     let mut decompressor = Decompressor::new();
     let mut report = EventVerificationReport::default();
     let mut error = None;
@@ -329,45 +278,4 @@ fn verify_event(
         .and_then(|event| wok_event::verify_strfry_event(packed, &event))
         .err()
         .map(|error| error.to_string()))
-}
-
-impl Env {
-    /// Mark a verified strfry v3 snapshot as Wok-owned. No event or index data
-    /// is rewritten by this operation.
-    pub fn upgrade_strfry_v3_to_wok(&self) -> Result<(), DbError> {
-        let mut txn = crate::RwTxn::begin(self)?;
-        let raw = txn
-            .get_u64(self.dbis().meta, 1)?
-            .ok_or_else(|| DbError::msg("strfry source has no Meta record"))?;
-        let mut meta = crate::decode_meta(raw)?;
-        if meta.endianness != 1 {
-            return Err(DbError::msg(
-                "strfry source was created on a machine with different endianness",
-            ));
-        }
-        if meta.db_version != wok_event::STRFRY_DB_VERSION {
-            return Err(DbError::msg(format!(
-                "strfry source database version {} (expected {})",
-                meta.db_version,
-                wok_event::STRFRY_DB_VERSION
-            )));
-        }
-        meta.db_version = wok_event::WOK_DB_VERSION;
-        txn.put_u64(self.dbis().meta, 1, &crate::encode_meta(&meta), 0)?;
-        txn.commit()
-    }
-}
-
-/// Open a snapshot without allowing the storage layer to create it. Kept here
-/// as a small convenience for migration callers.
-pub fn open_snapshot(path: &Path, no_read_ahead: bool) -> Result<Env, DbError> {
-    Env::open(
-        path,
-        EnvOptions {
-            no_read_ahead,
-            create_dir: false,
-            create_dbis: false,
-            ..EnvOptions::default()
-        },
-    )
 }

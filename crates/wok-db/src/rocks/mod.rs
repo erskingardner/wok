@@ -1,14 +1,13 @@
-//! Experimental optimized RocksDB layout. All relay policy remains in Wok.
-//! Bytewise ordered indexes are globally reversed, so newest-first logical
-//! scans advance forward physically. Event/payload components share one record;
-//! Author reads have a covering index while feeds retain thin postings, unless
-//! the separate `rocksdb-coverless` physical layout is selected at build time.
+//! Wok's sole runtime physical layout. Relay policy remains in Wok.
+//! Bytewise ordered indexes are globally reversed so newest-first scans advance
+//! forward physically. Event/payload components share one record; author reads
+//! use thin postings and atomic top-two frontiers.
 #![forbid(unsafe_code)]
 
 mod audit;
-#[cfg(feature = "rocksdb-author-heads")]
+
 pub(crate) mod author_heads;
-#[cfg(all(test, feature = "rocksdb-author-heads"))]
+#[cfg(test)]
 mod physical_seed_builder;
 
 use crate::schema::{dbi_specs, ComparatorKind};
@@ -70,25 +69,18 @@ pub(crate) fn load_markers(db: &rocksdb::DB) -> Result<MarkerMap, DbError> {
 
 pub(crate) const COMBINED: &str = "wok_events_combined_v1";
 pub(crate) const COVERING: &str = "wok_pubkey_covering_v1";
-#[cfg(feature = "rocksdb-author-heads")]
+
 pub(crate) const HEAD_CF: &str = "wok_author_frontiers_v1";
 pub(crate) const COVER_DBI: u32 = 23;
 pub(crate) const FORMAT_KEY: &[u8] = b"wok-rocksdb-format";
-#[cfg(not(feature = "rocksdb-coverless"))]
-pub(crate) const FORMAT: &[u8] = b"wok-rocks-v1:combined:dual-author:reverse-order:sync-wal";
-#[cfg(all(feature = "rocksdb-coverless", not(feature = "rocksdb-author-heads")))]
-pub(crate) const FORMAT: &[u8] = b"wok-rocks-v2:combined:thin-author:reverse-order:sync-wal";
-#[cfg(feature = "rocksdb-author-heads")]
+
 pub(crate) const FORMAT: &[u8] =
     b"wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal";
 
 /// Exact physical CF set for this binary; logical Event/Payload share COMBINED.
 pub(crate) fn physical_cf_names() -> Vec<&'static str> {
     let mut names = vec!["default", COMBINED];
-    if !cfg!(feature = "rocksdb-coverless") {
-        names.push(COVERING);
-    }
-    #[cfg(feature = "rocksdb-author-heads")]
+
     names.push(HEAD_CF);
     names.extend(
         dbi_specs()
@@ -102,7 +94,7 @@ pub(crate) fn physical_cf_names() -> Vec<&'static str> {
 }
 
 pub(crate) fn validate_dbi(dbi: u32) -> Result<(), DbError> {
-    if cfg!(feature = "rocksdb-coverless") && dbi == COVER_DBI {
+    if dbi == COVER_DBI {
         return Err(err("covering index is absent in the coverless layout"));
     }
     Ok(())
@@ -189,8 +181,8 @@ pub(crate) fn key_prefix(dbi: u32, key: &[u8]) -> Vec<u8> {
             if s.comparator != ComparatorKind::Uint64Uint64 {
                 escape(&key[..key.len() - ints * 8], &mut out);
             }
-            for n in key[key.len() - ints * 8..].chunks_exact(8) {
-                out.extend_from_slice(&u64::from_ne_bytes(n.try_into().unwrap()).to_be_bytes());
+            for n in key[key.len() - ints * 8..].as_chunks::<8>().0 {
+                out.extend_from_slice(&u64::from_ne_bytes(*n).to_be_bytes());
             }
         }
     } else if s.flags & MDB_INTEGERKEY != 0 {

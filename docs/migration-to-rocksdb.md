@@ -9,30 +9,27 @@ Meta version field becomes v5 in the destination; the source is unchanged.
 
 This command does not export and reimport event JSON. JSON export/import is not
 a full-state backend conversion: it does not preserve local IDs, encoded
-payload bytes or administrative state. A strfry v3 source must first go through
-the verified [strfry migration](migration-from-strfry.md) using an LMDB build.
+payload bytes or administrative state. A strfry v3 source uses the direct
+[verified strfry migration](migration-from-strfry.md), which also creates RocksDB.
 Unknown versions, tables or incompatible LMDB flags are refused.
 
-## Choose the binary and reserve space
+## Build and reserve space
 
-The default build uses LMDB. Keep that binary for the original database and
-build the complete RocksDB variant separately:
+Every Wok build uses RocksDB. Build with Rust 1.88+, a C/C++ compiler and libclang:
 
 ```sh
-cargo build --release --locked -p wok-cli --target-dir target/lmdb
-cargo build --release --locked -p wok-cli --features rocksdb \
-  --target-dir target/rocksdb
-./target/lmdb/release/wok storage-backend
-./target/rocksdb/release/wok storage-backend
+cargo build --release --locked -p wok-cli
+./target/release/wok storage-backend
 ```
 
-Each binary opens only its compiled backend and physical layout. The `rocksdb`
-feature selects the v3 thin-author/frontier layout and its optimized reader.
-Lower-level experimental layout features are documented in
-[the backend reference](rocksdb-experimental.md). `--version` is unchanged;
-`storage-backend` works without a configuration file or database.
+There are no backend/layout feature selectors. `storage-backend` works without a
+configuration file or database. Its retained identity,
+`rocksdb-author-heads-experimental`, is a historical name for the existing v3
+physical format; it does not select a different runtime. Older experimental v1
+or v2 RocksDB directories are not converted by this command. See
+[the storage reference](rocksdb-experimental.md).
 
-Source and destination paths must be valid UTF-8 for the manifest. The
+Resolved source and destination paths must be valid UTF-8 for the manifest. The
 destination's parent directory must already exist, be writable by the
 operator, and be outside the source. The destination itself must not exist,
 even as an empty directory or dangling symlink. The source and its locks,
@@ -43,7 +40,10 @@ length plus 2 GiB on the destination filesystem. This is a conservative
 estimate, not an upper bound on RocksDB's temporary compaction space. Keep the
 original database and any independent backup, allow additional operating
 headroom, and monitor the disk throughout conversion. The copy uses bounded
-batches and per-record limits; the native engines also have their own caches.
+batches and per-record limits: default batches are 8 MiB, individual source
+records are limited to 64 MiB and decoded event JSON to 16 MiB. A record over a
+limit refuses conversion rather than being skipped. Native engines also have
+their own caches.
 
 ## Stop, check, and copy
 
@@ -55,11 +55,11 @@ verify every event. Both modes use a registered read-only LMDB transaction:
 coordination can update `lock.mdb`.
 
 ```sh
-./target/rocksdb/release/wok migrate rocksdb \
+./target/release/wok migrate rocksdb \
   --source /var/lib/wok/lmdb-db \
   --output /var/lib/wok/rocks-db --check --json
 
-./target/rocksdb/release/wok migrate rocksdb \
+./target/release/wok migrate rocksdb \
   --source /var/lib/wok/lmdb-db \
   --output /var/lib/wok/rocks-db --confirm-relay-stopped
 ```
@@ -112,7 +112,7 @@ after publication, such as a parent-directory sync error, explicitly reports
 Review the manifest, then run the offline physical audit with the same binary:
 
 ```sh
-./target/rocksdb/release/wok --config /etc/wok/rocks.toml rocksdb-check
+./target/release/wok --config /etc/wok/rocks.toml rocksdb-check
 ```
 
 Set `[database].path` in that configuration to the new directory. Retain the
@@ -124,29 +124,29 @@ negentropy use before routing clients back to the service.
 
 RocksDB holds an exclusive writer-process lock. A separate importer, backup or
 maintenance process cannot open the database while the relay owns that lock;
-stop it first. This differs from LMDB's separate reader processes and coordinated
-single writer. Never run either backend against the other's directory.
+stop it first. This differs from older LMDB releases. Runtime commands never
+open an LMDB directory; only the explicit read-only migration path does.
 
 ## Back up and roll back
 
-Use the binary matching the database format:
+Stop the relay, then create a native checkpoint in a new directory:
 
 ```sh
 wok --config /etc/wok/wok.toml backup --output /var/backups/wok/db-snapshot
 ```
 
-The parent must exist and the output must be a new directory. LMDB creates a
-consistent compact snapshot through a read-only open without upgrading a v4
-source. RocksDB creates a native checkpoint and requires the relay to be
-stopped so the command can take its exclusive open. Source records are not
-modified by backup. Keep the complete directory and restore it only while the
-relay is stopped, using the matching binary and physical layout. Do not copy
-individual live database files or use the legacy `compact <file>` LMDB command
-as a RocksDB backup interface. Protect backups as carefully as the live state;
-they include administrative and moderation data.
+The parent must exist and the output must not. Backup takes an exclusive
+writable native open without initializing logical state. Keep the complete
+checkpoint directory and restore it only while the relay is stopped, using the
+same physical format. Source logical records are unchanged. New database and
+checkpoint directories are private (`0700`); writable opens strip other-user
+access. Read-only source imports do not change source permissions. Protect
+backups as carefully as live state: they include moderation and restricted data.
+Never copy individual live native files or use legacy LMDB `compact <file>` as a
+RocksDB backup interface.
 
-Before any post-cutover writes, rollback can stop RocksDB and restart the LMDB
-binary on the preserved source. After new writes, that LMDB directory is only
+Before any post-cutover writes, rollback can stop RocksDB and restart the previous Wok LMDB
+release on the preserved source. After new writes, that LMDB directory is only
 the pre-cutover snapshot: it does not contain newly accepted events or changed
 moderation, vanish, sequence and maintenance state. There is no automatic
 reverse converter or state merge. Plan and validate reconciliation or restore

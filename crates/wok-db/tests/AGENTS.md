@@ -1,6 +1,6 @@
 # wok-db/tests
 
-Storage integration tests. They open disposable LMDB environments.
+Storage integration tests. They open disposable RocksDB environments. Native LMDB fixtures exist only to test read-only migration inputs.
 
 | File | Role |
 | --- | --- |
@@ -11,7 +11,7 @@ Storage integration tests. They open disposable LMDB environments.
 | `tag_kind_index.rs` | `wok_Event__tagKind` through every write/delete path, reindex, drift reports |
 | `reindex_kept_tables.rs` | Reindex keeps each table events don't derive; names every table as kept or derived |
 | `failure_recovery.rs` | Unclean shutdown / recovery |
-| `file_mode.rs` | Permission bits of new database files, compact copies and migration snapshots |
+| `file_mode.rs` | Native directory privacy and read-only import source permissions |
 | `state_integrity.rs` | Corrupt state detection and valid lazy/deleted-tail state |
 | `nip59_gift_wrap.rs` | Gift-wrap deletion / recipient semantics |
 | `nip62_vanish.rs` | Request to Vanish markers and sweep |

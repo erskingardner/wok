@@ -272,32 +272,3 @@ where
     )?;
     Ok(())
 }
-
-#[cfg(all(test, not(feature = "rocksdb-backend")))]
-mod tests {
-    use super::*;
-    use crate::{Env, EnvOptions};
-
-    // LMDB accepts a four-byte integer key; RocksDB rejects it at put instead.
-    #[cfg(not(feature = "rocksdb-backend"))]
-    #[test]
-    fn foreach_event_from_reports_a_short_event_key_instead_of_panicking() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let env = Env::open(tmp.path(), EnvOptions::for_tests()).unwrap();
-        env.ensure_initialized().unwrap();
-        let mut txn = env.begin_rw().unwrap();
-        txn.put(env.dbis().event, &1u32.to_ne_bytes(), b"packed", 0)
-            .unwrap();
-        txn.commit().unwrap();
-
-        let txn = env.begin_ro().unwrap();
-        let mut visited = 0;
-        let err = foreach_event_from(&txn, 0, |_, _| {
-            visited += 1;
-            true
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("unexpected length"), "{err}");
-        assert_eq!(visited, 0);
-    }
-}

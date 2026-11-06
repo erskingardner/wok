@@ -699,7 +699,7 @@ on the dashboard; the database limits are restart settings, shown read-only.
 | `relay.abuse.max_stored_events_per_pubkey` | `1000000` | One key filling the disk. `0` is unlimited. | Active users and bots can no longer post new events. At quota, an author can still replace their own replaceable and addressable events and delete their own events. | — |
 | `relay.abuse.max_stored_events` | `0` | The disk, by a count of events in all. `0`, the public preset's value, is unlimited. | Once reached, every write on the relay fails but a NIP-62 vanish request. A busy public relay stores far more than 10,000,000 events, the default through 0.7. | — |
 | `database.min_free_disk_bytes` | `1073741824` | The filesystem: writes are refused before free space falls below this reserve. `0` turns the guard off. Restart. | Writes stop while the disk still has room. (Off or too small: the disk can fill, and the database with it.) | — |
-| `database.map_size` | `68719476736` | The LMDB map ceiling: writes fail atomically once the database reaches it. Address space only; the file grows as data is written. Restart. | Writes fail while the disk still has room. | — |
+| `database.map_size` | `68719476736` | Legacy LMDB setting, accepted for configuration continuity and ignored by the RocksDB runtime. | Does not impose a runtime storage ceiling. | — |
 
 A write over a quota is refused with `OK false`: `blocked: author storage
 quota exceeded`, or `error: global storage quota of <n> events exceeded` for
@@ -845,14 +845,15 @@ Restart settings, unless noted, and file-only.
 
 ## Database
 
-Restart settings, file-only. `database.map_size` and
-`database.min_free_disk_bytes` are under [Storage](#storage).
+Restart settings, file-only. `database.min_free_disk_bytes` is under
+[Storage](#storage). Map size, reader slots and LMDB read-ahead do not configure
+RocksDB; native cache/buffer settings are described in [storage](rocksdb-experimental.md).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `database.path` | `"./wok-db/"` | Wok-owned LMDB directory. |
-| `database.max_readers` | `256` | LMDB reader-slot ceiling. |
-| `database.no_read_ahead` | `false` | Disable LMDB read-ahead for workloads where it is counterproductive. |
+| `database.path` | `"./wok-db/"` | Wok-owned RocksDB directory. LMDB requires explicit offline migration to a new directory. |
+| `database.max_readers` | `256` | Legacy LMDB reader-slot setting; accepted but ignored by RocksDB. |
+| `database.no_read_ahead` | `false` | Legacy LMDB read-ahead setting; accepted but ignored by RocksDB. |
 
 ## Admin
 

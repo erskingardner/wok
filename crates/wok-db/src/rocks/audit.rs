@@ -53,7 +53,7 @@ impl Env {
             if !thin.is_empty() {
                 return Err(err("thin author posting contains payload"));
             }
-            #[cfg(feature = "rocksdb-author-heads")]
+
             {
                 let raw = snapshot
                     .get_cf(cf(HEAD_CF)?, event.pubkey())
@@ -71,34 +71,21 @@ impl Env {
                     return Err(err("author next position is older than a primary posting"));
                 }
             }
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            {
-                let cover = snapshot
-                    .get_cf(cf(COVERING)?, &posting)
-                    .map_err(err)?
-                    .ok_or_else(|| err("missing author cover"))?;
-                if cover != value {
-                    return Err(err("author cover differs from combined primary"));
-                }
-            }
+
             digest.update(id.to_le_bytes());
             digest.update((packed.len() as u64).to_le_bytes());
             digest.update(packed);
             digest.update((payload.len() as u64).to_le_bytes());
             digest.update(payload);
             count += 1;
-            if count % 100000 == 0 {
+            if count.is_multiple_of(100000) {
                 tracing::info!(events = count, "RocksDB physical audit progress");
             }
             it.next();
         }
         it.status().map_err(err)?;
         let mut counts = serde_json::Map::new();
-        let last_dbi = if cfg!(feature = "rocksdb-coverless") {
-            dbi_specs().len() as u32
-        } else {
-            COVER_DBI
-        };
+        let last_dbi = dbi_specs().len() as u32;
         for dbi in 1..=last_dbi {
             let mut it = snapshot.raw_iterator_cf(cf(cf_name(dbi))?);
             it.seek_to_first();
@@ -139,14 +126,12 @@ impl Env {
             .get(crate::schema::DBI_EVENT_PUBKEY)
             .and_then(|v| v.as_u64())
             != Some(count)
-            || (!cfg!(feature = "rocksdb-coverless")
-                && counts.get(COVERING).and_then(|v| v.as_u64()) != Some(count))
         {
             return Err(err(
                 "author indexes do not contain exactly one posting per primary",
             ));
         }
-        #[cfg(feature = "rocksdb-author-heads")]
+
         let (head_count, head_positions) = {
             // Each primary is dominated by first, and every non-first primary
             // by next (above). Both stored positions must reference a primary
@@ -203,8 +188,8 @@ impl Env {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let report = serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":if cfg!(feature="rocksdb-coverless"){0}else{count},"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"});
-        #[cfg(feature = "rocksdb-author-heads")]
+        let report = serde_json::json!({"ok":true,"events":count,"verified_signatures_and_bodies":count,"thin_author_records_verified":count,"covering_records_verified":0,"primary_fingerprint_sha256":hash,"table_counts":counts,"physical_column_families":physical_cf_names(),"layout":String::from_utf8_lossy(FORMAT),"durability":"one atomic cross-CF WriteBatch with sync WAL before ACK; no power-loss proof implied"});
+
         let report = {
             let mut report = report;
             report["author_head_records_verified"] = serde_json::json!(head_count);

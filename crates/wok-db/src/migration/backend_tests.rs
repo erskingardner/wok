@@ -7,9 +7,12 @@ use std::collections::BTreeMap;
 use wok_event::PackedEventView;
 
 fn signed(n: u64, who: u8, created: u64) -> crate::EventToWrite {
+    signed_kind(n, who, created, 1)
+}
+fn signed_kind(n: u64, who: u8, created: u64, kind: u64) -> crate::EventToWrite {
     let key = Keypair::from_secret_key(SECP256K1, &SecretKey::from_byte_array(&[who; 32]).unwrap());
     let mut value = json!({"pubkey":hex::encode(key.x_only_public_key().0.serialize()),
-        "kind":1,"created_at":created,"tags":[["t","full-state"]],
+        "kind":kind,"created_at":created,"tags":[["t","full-state"]],
         "content":format!("signed offline fixture {n}: 🥘\u{7f}")});
     let id = wok_event::event_id_hash(&value).unwrap();
     value["id"] = json!(hex::encode(id));
@@ -237,7 +240,6 @@ fn full_state_v5_is_byte_exact_across_bounded_commits_and_reopen() {
     assert_eq!(txn.get(20, &sweep_key).unwrap().unwrap()[16], 0x81);
     let fingerprint = crate::event_fingerprint(&env).unwrap();
     assert_eq!(hex(fingerprint.sha256), report.primary_fingerprint_sha256);
-    #[cfg(feature = "rocksdb-author-heads")]
     {
         let event = PackedEventView::new(txn.get_u64(3, 9).unwrap().unwrap()).unwrap();
         let author: &[u8; 32] = event.pubkey().try_into().unwrap();
@@ -627,4 +629,277 @@ fn damaged_native_value_is_refused_before_logical_decoding_can_clone_it() {
         Ok(_) => panic!("oversized physical value was accepted"),
     };
     assert!(error.to_string().contains("physical record exceeds"));
+}
+
+fn strfry_rows(root: &Path) -> Rows {
+    let mut rows = source_rows(root);
+    // This v3 fixture has signed kind1 events; remove deliberately opaque
+    // Wok-preservation-only postings that do not derive from those events.
+    for dbi in [7usize, 8, 11, 13] {
+        rows[dbi - 1].clear();
+    }
+    rows[15] = vec![(
+        [1u64.to_ne_bytes(), 0u64.to_ne_bytes()].concat(),
+        [0u64.to_ne_bytes(), 1u64.to_ne_bytes()].concat(),
+    )];
+    for id in [101u64, 102] {
+        let event = signed_kind(id, 7, id, 0);
+        let packed = PackedEventView::new(&event.packed).unwrap();
+        for entry in crate::write::event_index_entries(strfry::logical_dbis(), id, packed) {
+            rows[entry.dbi as usize - 1].push((entry.key, entry.value));
+        }
+        rows[2].push((id.to_ne_bytes().to_vec(), event.packed));
+        rows[14].push((
+            id.to_ne_bytes().to_vec(),
+            crate::encode_raw_payload(&event.json),
+        ));
+    }
+    rows
+}
+
+#[test]
+fn direct_strfry_import_preserves_all_native_bytes_and_compressed_bodies() {
+    let root = fixture_dir();
+    let rows = strfry_rows(root.path());
+    let source = root.path().join("v3");
+    write_source(&source, &rows, 3, true, false);
+    let before = bytes_hash(&source.join("data.mdb"));
+    assert!(
+        inspect_lmdb_source(&source).is_err(),
+        "v3 must require the explicit import API"
+    );
+    let audit = audit_strfry_source(&source, true).unwrap();
+    assert!(audit.integrity.ok(), "{:?}", audit.integrity);
+    assert_eq!(audit.event_verification.as_ref().unwrap().failed, 0);
+    let target = root.path().join("imported");
+    let copied = migrate_strfry_to_rocksdb(&source, &target, &small_batches()).unwrap();
+    assert_eq!(copied.verified_events, 6);
+    assert_eq!(audit.integrity.superseded_groups, 1);
+    assert_eq!(audit.integrity.superseded_events, 1);
+    assert!(
+        copied.meta_version_normalized
+            && copied.verified
+            && copied.sealed
+            && copied.source_unchanged
+    );
+    assert_eq!(
+        copied.primary_fingerprint_sha256,
+        hex(audit.fingerprint.sha256)
+    );
+    for table in &copied.tables {
+        if table.name != crate::schema::DBI_META {
+            assert_eq!(table.source_sha256, table.target_sha256, "{}", table.name);
+        }
+    }
+    assert_eq!(bytes_hash(&source.join("data.mdb")), before);
+    assert!(!source.join("CURRENT").exists());
+    assert!(Env::open(&source, EnvOptions::for_tests()).is_err());
+    let env = Env::open(&target, EnvOptions::for_tests()).unwrap();
+    env.ensure_initialized().unwrap();
+    assert_eq!(crate::event_fingerprint(&env).unwrap(), audit.fingerprint);
+    let txn = env.begin_ro().unwrap();
+    let raw = txn.get_u64(env.dbis().event, 9).unwrap().unwrap();
+    let author: &[u8; 32] = PackedEventView::new(raw)
+        .unwrap()
+        .pubkey()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        txn.author_heads([author]).unwrap()[0]
+            .unwrap()
+            .first
+            .local_id,
+        102
+    );
+}
+
+#[test]
+fn strfry_source_audit_detects_missing_extra_and_nonverifying_records() {
+    let root = fixture_dir();
+    let valid = strfry_rows(root.path());
+    for case in 0..5 {
+        let mut rows = valid.clone();
+        match case {
+            0 => {
+                rows[9].pop();
+            } // absent required thin posting
+            1 => {
+                rows[3].push((b"wrong-id-posting".to_vec(), 9u64.to_ne_bytes().to_vec()));
+            }
+            2 => {
+                rows[14][0].1 = crate::encode_raw_payload("{}");
+            }
+            3 => {
+                rows[15].push((vec![0; 16], vec![0; 3]));
+            } // malformed tree metadata
+            _ => {
+                rows[9][0].0[0] ^= 1;
+            } // equal-count wrong-author posting
+        }
+        let source = root.path().join(format!("bad-v3-{case}"));
+        write_source(&source, &rows, 3, true, false);
+        let before = bytes_hash(&source.join("data.mdb"));
+        let audit = audit_strfry_source(&source, true).unwrap();
+        assert!(
+            !audit.integrity.ok() || !audit.event_verification.as_ref().unwrap().ok(),
+            "case {case}"
+        );
+        let dest = root.path().join(format!("rejected-{case}"));
+        assert!(migrate_strfry_to_rocksdb(&source, &dest, &small_batches()).is_err());
+        assert!(
+            !dest.exists(),
+            "corrupt source must fail before output allocation"
+        );
+        assert_eq!(bytes_hash(&source.join("data.mdb")), before);
+    }
+}
+
+#[test]
+fn strfry_rejects_mixed_wok_tables_and_non_v3_versions() {
+    let root = fixture_dir();
+    let rows = strfry_rows(root.path());
+    for (version, optional) in [(3, false), (4, true), (5, true), (99, true)] {
+        let source = root.path().join(format!("version-{version}-{optional}"));
+        write_source(&source, &rows, version, optional, false);
+        assert!(inspect_strfry_source(&source).is_err());
+    }
+}
+
+#[test]
+fn strfry_derived_initialization_retains_history_and_first_write_updates_its_count() {
+    let root = fixture_dir();
+    let rows = strfry_rows(root.path());
+    let source = root.path().join("v3-history-init");
+    write_source(&source, &rows, 3, true, false);
+    let audit = audit_strfry_source(&source, true).unwrap();
+    let target = root.path().join("history-ready");
+    let copied = migrate_strfry_to_rocksdb(&source, &target, &small_batches()).unwrap();
+    let env = Env::open(&target, EnvOptions::for_tests()).unwrap();
+    initialize_strfry_derived_state(&env, &copied, &audit).unwrap();
+    {
+        let txn = env.begin_ro().unwrap();
+        assert_eq!(crate::state::superseded_events_ro(&txn).unwrap(), Some(1));
+        assert_eq!(txn.entries(20).unwrap(), 1);
+    }
+    // This is the same runtime initialization used by the direct CLI, but its
+    // count is already present, so neither opening nor the first mutation has
+    // to walk the legacy replacement index with an accumulating generic cursor.
+    env.ensure_initialized().unwrap();
+    for dbi in 1..=16u32 {
+        assert_eq!(
+            hash_table(&env, dbi, &small_batches()).unwrap().digest(),
+            copied.tables[dbi as usize - 1].target_sha256
+        );
+    }
+    assert_eq!(
+        verify_rocksdb_events_bounded(&env).unwrap(),
+        audit.fingerprint
+    );
+    {
+        let mut txn = env.begin_rw().unwrap();
+        let mut events = [signed_kind(500, 7, 500, 0)];
+        crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+        assert_eq!(events[0].status, crate::EventWriteStatus::Written);
+        assert_eq!(events[0].lev_id, u64::MAX - 1);
+        txn.commit().unwrap();
+    }
+    let txn = env.begin_ro().unwrap();
+    assert_eq!(crate::state::superseded_events_ro(&txn).unwrap(), Some(0));
+    assert!(txn.get_u64(3, 101).unwrap().is_none());
+    assert!(txn.get_u64(3, 102).unwrap().is_none());
+    assert!(txn.get_u64(3, u64::MAX - 1).unwrap().is_some());
+}
+
+#[test]
+fn strfry_zero_history_is_initialized_and_existing_zero_or_other_state_is_refused() {
+    let root = fixture_dir();
+    let mut rows = strfry_rows(root.path());
+    // Keep only the newest version of this address, leaving no superseded
+    // history. Its native rows remain a complete, signed v3 snapshot.
+    for dbi in [3usize, 15] {
+        rows[dbi - 1].retain(|(key, _)| key != &101u64.to_ne_bytes());
+    }
+    for dbi in 4usize..=13 {
+        rows[dbi - 1].retain(|(_, value)| value != &101u64.to_ne_bytes());
+    }
+    let source = root.path().join("zero-history-v3");
+    write_source(&source, &rows, 3, true, false);
+    let audit = audit_strfry_source(&source, true).unwrap();
+    assert_eq!(audit.integrity.superseded_events, 0);
+    let target = root.path().join("zero-ready");
+    let copied = migrate_strfry_to_rocksdb(&source, &target, &small_batches()).unwrap();
+    let env = Env::open(&target, EnvOptions::for_tests()).unwrap();
+    initialize_strfry_derived_state(&env, &copied, &audit).unwrap();
+    assert_eq!(
+        crate::state::superseded_events_ro(&env.begin_ro().unwrap()).unwrap(),
+        Some(0)
+    );
+    assert!(
+        initialize_strfry_derived_state(&env, &copied, &audit).is_err(),
+        "zero is already initialized, not absence"
+    );
+    env.ensure_initialized().unwrap();
+    {
+        let mut txn = env.begin_rw().unwrap();
+        let mut events = [signed(600, 8, 600)];
+        crate::write_events(&mut txn, &mut crate::NoopNegentropy, &mut events, false).unwrap();
+        assert_eq!(events[0].status, crate::EventWriteStatus::Written);
+        txn.commit().unwrap();
+    }
+    assert_eq!(
+        crate::state::superseded_events_ro(&env.begin_ro().unwrap()).unwrap(),
+        Some(0)
+    );
+    for (case, value) in [("existing-zero", 0u64), ("existing-nonzero", 19)] {
+        let target = root.path().join(case);
+        let copied = migrate_strfry_to_rocksdb(&source, &target, &small_batches()).unwrap();
+        let env = Env::open(&target, EnvOptions::for_tests()).unwrap();
+        let mut txn = env.begin_rw().unwrap();
+        txn.put(20, crate::state::SUPERSEDED_EVENTS, &value.to_le_bytes(), 0)
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(initialize_strfry_derived_state(&env, &copied, &audit).is_err());
+        assert_eq!(
+            crate::state::superseded_events_ro(&env.begin_ro().unwrap()).unwrap(),
+            Some(value)
+        );
+    }
+}
+
+#[test]
+fn strfry_derived_initialization_requires_matching_destination_audit_and_fresh_extensions() {
+    let root = fixture_dir();
+    let rows = strfry_rows(root.path());
+    let source = root.path().join("source-for-init-guards");
+    write_source(&source, &rows, 3, true, false);
+    let audit = audit_strfry_source(&source, true).unwrap();
+    let first = root.path().join("first-target");
+    let copied = migrate_strfry_to_rocksdb(&source, &first, &small_batches()).unwrap();
+    let second = root.path().join("other-target");
+    migrate_strfry_to_rocksdb(&source, &second, &small_batches()).unwrap();
+    let other = Env::open(&second, EnvOptions::for_tests()).unwrap();
+    assert!(initialize_strfry_derived_state(&other, &copied, &audit).is_err());
+    assert_eq!(other.begin_ro().unwrap().entries(20).unwrap(), 0);
+    let env = Env::open(&first, EnvOptions::for_tests()).unwrap();
+    let mut wrong = audit.clone();
+    wrong.source.transaction_id += 1;
+    assert!(initialize_strfry_derived_state(&env, &copied, &wrong).is_err());
+    let mut wrong = audit.clone();
+    wrong.fingerprint.sha256[0] ^= 1;
+    assert!(initialize_strfry_derived_state(&env, &copied, &wrong).is_err());
+    let mut wrong = audit.clone();
+    wrong.event_verification = None;
+    assert!(initialize_strfry_derived_state(&env, &copied, &wrong).is_err());
+    assert_eq!(env.begin_ro().unwrap().entries(20).unwrap(), 0);
+    let mut txn = env.begin_rw().unwrap();
+    txn.put(20, b"opaque-existing-state", b"", 0).unwrap();
+    txn.commit().unwrap();
+    assert!(initialize_strfry_derived_state(&env, &copied, &audit).is_err());
+    assert_eq!(
+        env.begin_ro()
+            .unwrap()
+            .get(20, b"opaque-existing-state")
+            .unwrap(),
+        Some(&[][..])
+    );
 }

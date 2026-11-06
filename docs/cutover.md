@@ -1,14 +1,16 @@
 # Cutover and rollback
 
-For Wok's optional RocksDB backend, use the separate
+To upgrade an existing Wok LMDB database, use the separate
 [offline LMDB-to-RocksDB procedure](migration-to-rocksdb.md). It preserves the
 full database state and describes directory backups and rollback after writes.
 
 ## Cutover (strfry → wok)
 
-1. Run `wok migrate strfry --db <strfry-db> --config <strfry.conf> --output <new-wok-dir> --check` and review every ignored key, path, capacity, and active-process warning.
-2. Stop C++ strfry.
-3. Rerun the command without `--check` to create the verified Wok-owned output.
+1. Stop C++ strfry and every other source writer; keep them stopped through
+   preflight and copying.
+2. Run `wok migrate strfry --db <strfry-db> --config <strfry.conf> --output <new-wok-dir> --check` and review every ignored key, path, capacity, and active-process warning.
+3. Rerun without `--check` and with `--confirm-relay-stopped` to create the
+   verified RocksDB output directly from strfry v3.
 4. Inspect `<new-wok-dir>/migration-manifest.json` and review the generated
    `wok.toml`, especially plugin, policy, and socket paths.
 5. Start `wok --config <new-wok-dir>/wok.toml relay`.
@@ -26,5 +28,5 @@ full database state and describes directory backups and rollback after writes.
    before an operational cutover.
 4. Unix socket clients must be disabled or moved; strfry has no Unix Nostr listener.
 
-Do not point strfry at Wok's v5 database and never mix writers on one LMDB
-environment. See [migration-from-strfry.md](migration-from-strfry.md).
+Do not point strfry at Wok's RocksDB directory or share writers. Runtime Wok
+commands do not open LMDB; import commands only read a stopped source. See [migration-from-strfry.md](migration-from-strfry.md).

@@ -22,11 +22,11 @@ class DatabaseBudget(unittest.TestCase):
                 (root / name).write_bytes(b"x" * size)
             self.assertEqual(soak.database_bytes(root), 146)
 
-    def test_lmdb_count_includes_both_data_and_lock_files(self):
+    def test_size_includes_metadata_and_lock_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "data.mdb").write_bytes(b"data")
-            (root / "lock.mdb").write_bytes(b"lock")
+            (root / "CURRENT").write_bytes(b"data")
+            (root / "LOCK").write_bytes(b"lock")
             self.assertEqual(soak.database_bytes(root), 8)
 
     def test_compaction_can_remove_a_file_after_the_directory_listing(self):
@@ -55,9 +55,9 @@ class IdentityAndResults(unittest.TestCase):
         for actual in ["lmdb", "rocksdb-coverless-experimental", "rocksdb-optimized-experimental"]:
             with self.subTest(actual=actual), patch.object(soak.subprocess, "run", return_value=types.SimpleNamespace(stdout=actual)):
                 with self.assertRaises(RuntimeError):
-                    soak.verify_backend(Path("/unused/wok"), "rocksdb")
+                    soak.verify_backend(Path("/unused/wok"))
         with patch.object(soak.subprocess, "run", return_value=types.SimpleNamespace(stdout="rocksdb-author-heads-experimental\n")) as run:
-            self.assertEqual(soak.verify_backend(Path("/unused/wok"), "rocksdb"), "rocksdb-author-heads-experimental")
+            self.assertEqual(soak.verify_backend(Path("/unused/wok")), "rocksdb-author-heads-experimental")
             self.assertEqual(run.call_args.args[0][-1], "storage-backend")
 
     def test_missing_crash_or_feed_verification_refuses_successful_driver_exit(self):

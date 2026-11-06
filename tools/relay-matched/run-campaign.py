@@ -228,10 +228,45 @@ def known_read_disconnect_error(error):
     return error in sends | receives
 
 
-def validate_network(report, events, write_rate, read_rate, corpus_hash, query_hash, *, corpus_events=None, seed=None, drain_secs=None, allow_censored=False, require_count_settled=False, verified_read_ingress_overload=False):
+def matched_writer_arguments(mode):
+    assert mode in {"disjoint", "queried"}, "unknown matched writer author mode"
+    return [] if mode == "disjoint" else ["--matched-writer-authors", mode]
+
+
+def validate_writer_workload(report, expected_mode):
+    assert report.get("matched_writer_authors", "disjoint") == expected_mode, "writer author mode differs"
+    if expected_mode == "disjoint":
+        return
+    assert expected_mode == "queried", "unknown matched writer author mode"
+    workload = report["workload"]
+    assert workload["format"] == "network-matched-queried-authors-v1"
+    assert workload["matched_writer_authors"] == "queried"
+    canonical = json.dumps(workload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    assert hashlib.sha256(canonical).hexdigest() == report["workload_sha256"], "workload identity digest differs"
+    for key in ["corpus_sha256", "query_plan_sha256", "history_cutoff", "seed", "offered_writes",
+                "write_rate", "read_rate", "read_connections", "publish_connections", "drain_secs"]:
+        assert workload[key] == report[key], f"workload identity differs at {key}"
+    writer = workload["writer_authors"]
+    assert writer["mode"] == "queried" and writer["author_count"] == 64
+    for key in ["pubkey_set_sha256", "timed_event_ids_sha256"]:
+        assert re.fullmatch(r"[0-9a-f]{64}", writer[key]), f"missing writer digest {key}"
+    overlap = writer["query_shape_overlap"]
+    assert set(overlap) == {"author", "feed500", "tag", "id"}
+    for shape, value in overlap.items():
+        assert value["plans"] == 64
+        if shape in {"author", "feed500"}:
+            assert value["author_filter_plans"] == value["plans_with_writer_authors"] == 64
+            assert 1 <= value["minimum_writer_authors"] <= value["maximum_writer_authors"] <= 64
+        else:
+            assert value["author_filter_plans"] == value["plans_with_writer_authors"] == 0
+            assert value["minimum_writer_authors"] is None and value["maximum_writer_authors"] is None
+
+
+def validate_network(report, events, write_rate, read_rate, corpus_hash, query_hash, *, corpus_events=None, seed=None, drain_secs=None, allow_censored=False, require_count_settled=False, verified_read_ingress_overload=False, matched_writer_authors="disjoint"):
     assert report["format"] == "network-matched-v1", "wrong network report format"
     assert report.get("stage") != "preflight_or_setup", f"network preflight/setup failed: {report.get('error', 'missing diagnostic')}"
     assert report["ok"] is True or allow_censored, "network trial failed"
+    validate_writer_workload(report, matched_writer_authors)
     if require_count_settled:
         preflight = report.get("preflight", {})
         assert preflight.get("count_terminal_response") is True and preflight.get("measurement_starts_after_count") is True, "preflight COUNT was not proven complete before measurement"
@@ -789,6 +824,7 @@ class Campaign:
                        "--corpus", str(self.corpus_remote[stage.name]), "--events", str(events), "--send-rate", str(rate),
                        "--read-rate", str(read_rate), "--read-connections", "2", "--publish-connections", "32", "--drain-secs", str(self.args.drain_secs),
                        "--seed", str(self.args.seed), "--out", str(remote)]
+            network += matched_writer_arguments(getattr(self.args, "matched_writer_authors", "disjoint"))
             save(evidence / "commands.json", {"relay": command, "network": network, "relay_unit": unit})
             self.update(state="running", stage=stage.name, job=position, jobs=total, name=name, arm=arm, write_rate=rate, read_rate=read_rate,
                         unit=unit, relay_log=str(evidence / "relay.log"), load_output=str(remote))
@@ -825,7 +861,7 @@ class Campaign:
                 save(evidence / "backend-final-stats.json", final[0])
             result = read(evidence / "load" / "network-matched.json")
             overload = self.classify_read_overload(stage,arm,evidence,result,events)
-            self.query_hashes[stage.name] = validate_network(result, events, rate, read_rate, corpus_hash, self.query_hashes[stage.name], corpus_events=corpus_manifest["events"], seed=self.args.seed, drain_secs=self.args.drain_secs, allow_censored=stage.name == "main", require_count_settled=self.args.rerun_network, verified_read_ingress_overload=overload is not None)
+            self.query_hashes[stage.name] = validate_network(result, events, rate, read_rate, corpus_hash, self.query_hashes[stage.name], corpus_events=corpus_manifest["events"], seed=self.args.seed, drain_secs=self.args.drain_secs, allow_censored=stage.name == "main", require_count_settled=self.args.rerun_network, verified_read_ingress_overload=overload is not None, matched_writer_authors=getattr(self.args, "matched_writer_authors", "disjoint"))
             outcome = "completed" if result["ok"] else ("relay_read_ingress_overload" if overload else ("harness_bound" if any("pending safety bound" in error for error in result["errors"]) else "completed_with_censored_overload"))
             if overload and self.args.retain_overload_on_load:
                 self.update(state="retaining_overloaded_database",stage=stage.name,name=name)
@@ -835,7 +871,7 @@ class Campaign:
                  "durability": "fastr stock OK has no fsync guarantee" if arm == "fastr" else "relay default verified/durable write policy"})
         result = read(evidence / "load" / "network-matched.json")
         overload = self.classify_read_overload(stage,arm,evidence,result,events)
-        self.query_hashes[stage.name] = validate_network(result, events, rate, read_rate, corpus_hash, self.query_hashes[stage.name], corpus_events=corpus_manifest["events"], seed=self.args.seed, drain_secs=self.args.drain_secs, allow_censored=stage.name == "main", require_count_settled=self.args.rerun_network, verified_read_ingress_overload=overload is not None)
+        self.query_hashes[stage.name] = validate_network(result, events, rate, read_rate, corpus_hash, self.query_hashes[stage.name], corpus_events=corpus_manifest["events"], seed=self.args.seed, drain_secs=self.args.drain_secs, allow_censored=stage.name == "main", require_count_settled=self.args.rerun_network, verified_read_ingress_overload=overload is not None, matched_writer_authors=getattr(self.args, "matched_writer_authors", "disjoint"))
         outcome = read(complete)["outcome"]
         if database.exists() and outcome == "completed":
             self.cleanup(database)
@@ -867,7 +903,8 @@ class Campaign:
         helper_hash = self.remote(["sha256sum", str(self.remote_helper)], capture_output=True, text=True).stdout.split()[0]
         assert helper_hash == sha(__file__), "load resource-wrapper transfer mismatch"
         remote_hash = self.remote(["sha256sum", str(args.load_bench_binary)], capture_output=True, text=True).stdout.split()[0]
-        identity = {"options": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        identity = {"options": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+                                if k != "matched_writer_authors" or v != "disjoint"},
                     "controller_sha256": sha(__file__), "source_manifest": read(args.source_manifest),
                     "source_manifest_sha256": sha(args.source_manifest), "binaries": {arm: sha(path) for arm, path in self.binary.items()},
                     "bench_binary_sha256": remote_hash, "wok_template_sha256": sha(args.wok_config_template),
@@ -948,6 +985,8 @@ def main():
     parser.add_argument("--seed", type=int, default=257)
     parser.add_argument("--corpus-events", type=int, default=15000000)
     parser.add_argument("--events", type=int, default=80000)
+    parser.add_argument("--matched-writer-authors", choices=["disjoint", "queried"], default="disjoint",
+                        help="Legacy independent32authors, or64actualhistoricalauthor-plan keys; queried requires same matched-corpus seed and new evidence")
     parser.add_argument("--qualification-corpus-events", type=int, default=12000)
     parser.add_argument("--qualification-events", type=int, default=1000)
     parser.add_argument("--load-memory-gib", type=int, default=56)

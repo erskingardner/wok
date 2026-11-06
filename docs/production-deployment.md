@@ -90,37 +90,37 @@ impact of a compromised admin credential.
 - Keep the binary, service unit, configuration, and plugin executables owned
   by root and not writable by the `wok` account.
 - Keep `/var/lib/wok` mode `0700` and owned by `wok:wok`. Do not let another
-  service open the live LMDB environment for writes.
-- Size `database.map_size`, `database.min_free_disk_bytes`, and the global and
+  service open or replace the live RocksDB directory.
+- Size `database.min_free_disk_bytes` and the global and
   per-pubkey storage ceilings for the host. Alert before the disk reserve or
-  map ceiling is reached.
-- Back up with a filesystem snapshot or another LMDB-safe procedure. Never
-  copy live LMDB files independently and assume the pair is consistent.
-  `wok backup --output <new-directory>` creates a compact LMDB snapshot or a
-  native RocksDB checkpoint; stop a RocksDB relay first. Use the binary matching
-  the stored backend. See [backend migration and backups](migration-to-rocksdb.md).
+  storage reserve is reached. Legacy LMDB map/read-ahead settings do not tune RocksDB.
+- Stop the relay before `wok backup --output <new-directory>` to create a
+  native RocksDB checkpoint. Keep its complete directory; never copy live
+  native files independently and assume a consistent snapshot. See
+  [migration and backups](migration-to-rocksdb.md).
 - Run `wok doctor` after an unclean stop and before returning the instance to
   service. Run `wok integrity` periodically and retain its exit status.
 
-## LMDB semaphores on macOS
+## LMDB import semaphores on macOS
 
-On macOS, lmdb-sys builds LMDB with `MDB_USE_POSIX_SEM`. Every open
+LMDB is used only for read-only imports. On macOS, lmdb-sys builds it with
+`MDB_USE_POSIX_SEM`. Every open
 environment creates two named POSIX semaphores (`/MDBr<hash>` and
 `/MDBw<hash>`, hashed from the `lock.mdb` device and inode). LMDB unlinks them
 only in `mdb_env_close` in the last process using the environment, or when a
 later exclusive open of the same `lock.mdb` file clears stale names. Linux
 builds use robust mutexes inside `lock.mdb` and are not affected.
 
-A process that exits with an `Env` still open leaks both semaphores until
-reboot. Causes include `kill -9`, a panic in a release build
-(`panic = "abort"`), `process::exit`, and relay threads that are still running
-at exit. A live relay database reclaims its own pair the next time it opens.
+An importing process or older LMDB-based release that exits with its source
+environment open can leak both semaphores until reboot. Causes include
+`kill -9`, an abort or `process::exit`. Reopening the same lock file can
+reclaim its own pair; the RocksDB relay does not use these semaphores.
 Leaks accumulate when the lock file is gone: test temp directories, deleted
 scratch databases, replaced migration outputs. macOS cannot list these
 semaphores, and their names cannot be recomputed once the inode is gone.
 
 The table is system-wide (`sysctl kern.posix.sem.max`, default 10000). When it
-fills up, every `Env::open` fails with `Lmdb(28, "No space left on device")`
+fills up, an LMDB source open can fail with `Lmdb(28, "No space left on device")`
 (ENOSPC from `sem_open`) even when disk and memory are free. Remedies:
 
 - Reboot. This clears all named semaphores.

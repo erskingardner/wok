@@ -348,11 +348,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     }
     Ok(Report {
         storage_backend: wok_db::storage_backend_name(),
-        file_growth_scope: if wok_db::storage_backend_name() == "lmdb" {
-            "data.mdb"
-        } else {
-            "all native database files; no forced flush or compaction"
-        },
+        file_growth_scope: "all native database files; no forced flush or compaction",
         corpus_events,
         preloaded,
         preload_stored: preload.stored,
@@ -363,12 +359,7 @@ pub fn run(opts: &Options) -> Result<Report> {
 }
 
 fn database_bytes(env: &wok_db::Env) -> Result<u64> {
-    if wok_db::storage_backend_name() == "lmdb" {
-        // Keep the historical LMDB measurement unchanged.
-        Ok(std::fs::metadata(env.path().join("data.mdb"))?.len())
-    } else {
-        Ok(env.stats()?.used_bytes)
-    }
+    Ok(env.stats()?.used_bytes)
 }
 
 #[cfg(feature = "op-log")]

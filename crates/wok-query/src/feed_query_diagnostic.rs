@@ -41,7 +41,7 @@ const MAX_SLICES: usize = 64;
 #[derive(Clone, Copy)]
 enum DiagnosticComparison {
     CreatedAtMembership,
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     AuthorFrontiers,
 }
 
@@ -49,7 +49,7 @@ impl DiagnosticComparison {
     fn arms(self, pass: u32, original_index: usize) -> [Arm; 2] {
         let candidate = match self {
             Self::CreatedAtMembership => Arm::CreatedAtMembership,
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             Self::AuthorFrontiers => Arm::AuthorHeads,
         };
         // The original external feed indexes are all odd: order alternates by
@@ -65,7 +65,7 @@ impl DiagnosticComparison {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Arm {
     Pubkey,
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     AuthorHeads,
     CreatedAtMembership,
     BoundedGlobalPeek,
@@ -76,7 +76,7 @@ impl Arm {
     fn name(self) -> &'static str {
         match self {
             Self::Pubkey => "pubkey_control",
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             Self::AuthorHeads => "author_frontier_reader",
             Self::CreatedAtMembership => "created_at_membership",
             Self::BoundedGlobalPeek => "bounded_global_peek",
@@ -89,7 +89,7 @@ impl Arm {
             Self::Pubkey => {
                 #[allow(unused_mut)]
                 let mut scan = DbScan::new(filter, txn);
-                #[cfg(feature = "rocksdb-author-head-reads")]
+
                 {
                     // Keep the existing diagnostic's control causal when a
                     // separate frontier experiment is built into this binary.
@@ -97,7 +97,7 @@ impl Arm {
                 }
                 scan
             }
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             Self::AuthorHeads => DbScan::new(filter, txn),
             Self::BoundedGlobalPeek => super::bounded_feed_diagnostic::configure(
                 filter,
@@ -174,7 +174,7 @@ pub(super) struct Plan {
     pub(super) cursors: usize,
     pub(super) initial_depth: u64,
     pub(super) refill_depths: Vec<u64>,
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     pub(super) author_head_reads: bool,
 }
 
@@ -190,7 +190,7 @@ pub(super) struct Sample {
     // These are cumulative chronological work values, not elapsed-time shares.
     pub(super) slice_work: Vec<u64>,
     pub(super) measurements: ReadMeasurements,
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     pub(super) author_frontier_initialization: super::author_head_scan::InitializationStats,
     pub(super) bounded: Option<super::bounded_feed_diagnostic::Stats>,
     pub(super) diagnostic_closure_elapsed_us: u64,
@@ -227,7 +227,7 @@ pub(super) fn read_arm(
     );
     query.track_completeness();
     query.set_visibility(options.visibility.clone());
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     {
         query.diagnostic_author_head_reads = Some(matches!(arm, Arm::AuthorHeads));
     }
@@ -246,7 +246,7 @@ pub(super) fn read_arm(
             cursors: scan.cursor_count(),
             initial_depth: scan.initial_scan_depth,
             refill_depths: scan.refill_scan_depths.clone(),
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             author_head_reads: scan.author_head_reads,
         };
         query.scanner = Some(QueryScanner::Chronological(scan));
@@ -332,7 +332,7 @@ pub(super) fn read_arm(
         peek_candidates: PEEK_CANDIDATES - query.peek_budget.candidates,
         slice_work,
         measurements,
-        #[cfg(feature = "rocksdb-author-head-reads")]
+
         author_frontier_initialization: query.diagnostic_author_frontier_initialization,
         bounded: query.diagnostic_feed_stats,
         diagnostic_closure_elapsed_us: elapsed,
@@ -403,7 +403,7 @@ fn read_comparison_arm(
     comparison: DiagnosticComparison,
 ) -> Result<Sample, String> {
     let sample = read_arm(env, group, arm, options)?;
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     if matches!(comparison, DiagnosticComparison::AuthorFrontiers) {
         validate_frontier_sample(&sample, arm)?;
     }
@@ -437,7 +437,7 @@ fn comparison_sample_json(
         completeness_equal,
         pair_equivalent,
     );
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     if matches!(comparison, DiagnosticComparison::AuthorFrontiers) {
         let object = row.as_object_mut().expect("sample object");
         // Keep the old formatter/contract unchanged. The new result reports no
@@ -597,12 +597,12 @@ fn diagnose_comparison(
         "different_pairs":differences,"processing_limited_pairs":limited,"processing_errors":errors,
         "harness_source_sha256":digest(include_bytes!("feed_query_diagnostic.rs")),
         "input_parser_source_sha256":digest(include_bytes!("range_seed_diagnostic.rs")),
-        "storage_backend":wok_db::storage_backend_name(),"thin_author_feature":cfg!(feature="rocksdb-thin-author-reads"),
+        "storage_backend":wok_db::storage_backend_name(),"thin_author_feature":true,
         "digest_framing":"Ordered local-ID u64 big-endian, length u64 big-endian, exact component bytes; separate SHA-256 streams for packed, encoded payload and decoded body.",
         "scope":"One fresh transaction per arm, unchanged control planner versus forced CreatedAt with original authors residual and index_only=false. Normal DbQuery visibility, latest, dedup, limit50, completeness and payload callbacks. External harness uses zero-microsecond slices at normal >2000-work checks and at most64 slices per arm; exact limits recorded separately. Same snapshot retained across slices, unlike worker-pass refresh. Planning/query/body hashing measured; opening and exact stored-byte validation excluded. Native/OS caches shared; alternating order does not reset them.",
         "limits":"This is a full-query forced-plan diagnostic, not a bounded planner or network timing. Plan-specific work/counters are reported, not required equal. Higher residual work can exhaust the normal completeness peek sooner: such a hint difference makes strict pair_equivalent false even when conservative Unknown is truthful. Interrupted or payload-failed queries never pass; completeness on an interrupted result is not final. Exact valid-record equivalence does not promise identical malformed-primary detection between index-only and residual plans; full offline corruption auditing is separate. Returned primary-pin bytes can include combined payload bytes; named copies are partial, native block reads are not device I/O. Copy/input/build provenance belongs to host. No sparse/adverse15M input is authorized by this harness."
     });
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     if matches!(comparison, DiagnosticComparison::AuthorFrontiers) {
         decorate_frontier_report(&mut report);
         report["selected_original_input_indexes"] = json!(feed_inputs
@@ -664,7 +664,7 @@ pub(super) fn event(n: u64, who: u64, created: u64, kind: u64, expiration: u64) 
     let mut id = [0u8; 32];
     id[..8].copy_from_slice(&n.to_be_bytes());
     let mut tags = PackedEventTagBuilder::default();
-    tags.add('t', if n % 2 == 0 { b"red" } else { b"blue" })
+    tags.add('t', if n.is_multiple_of(2) { b"red" } else { b"blue" })
         .unwrap();
     tags.add('p', &author(9)).unwrap();
     let packed =
@@ -1162,7 +1162,7 @@ fn unchanged_metadata_parser_selection_pairing_and_readonly_closure_smoke() {
     assert_eq!(report["pairs_checked"], 4);
     let rows = report["records"].as_array().unwrap();
     assert_eq!(rows.len(), 8);
-    for pair in rows.chunks_exact(2) {
+    for pair in rows.as_chunks::<2>().0 {
         assert!(pair
             .iter()
             .all(|r| r["pair_equivalent"] == true && r["completed"] == true));
@@ -1301,7 +1301,7 @@ fn report_retains_hint_differences_and_never_passes_limited_or_failed_payload_pa
 
 // This entry is deliberately separate from diagnose_existing_seed_feeds. The
 // parent/host owns source/binary/native/layout/copy/audit/resource provenance.
-#[cfg(feature = "rocksdb-author-head-reads")]
+
 const FRONTIER_WRAPPER_FIELDS: &[&str] = &[
     "author_head_multiget_calls",
     "author_head_keys",
@@ -1335,7 +1335,6 @@ const FRONTIER_WRAPPER_FIELDS: &[&str] = &[
     "cover_cached_owned_hits",
 ];
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 const FRONTIER_NATIVE_FIELDS: &[&str] = &[
     "user_key_comparison_count",
     "seek_on_memtable_count",
@@ -1352,7 +1351,6 @@ const FRONTIER_NATIVE_FIELDS: &[&str] = &[
     "get_from_memtable_count",
 ];
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 fn validate_frontier_sample(sample: &Sample, arm: Arm) -> Result<(), String> {
     let measured =
         serde_json::to_value(sample.measurements).map_err(|_| "measurement encoding failed")?;
@@ -1402,7 +1400,6 @@ fn validate_frontier_sample(sample: &Sample, arm: Arm) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 fn decorate_frontier_report(report: &mut Value) {
     use std::collections::BTreeMap;
     let rows = report["records"].as_array().expect("records");
@@ -1455,9 +1452,9 @@ fn decorate_frontier_report(report: &mut Value) {
     object.insert(
         "feature_flags".into(),
         json!({
-            "rocksdb_author_heads":cfg!(feature="rocksdb-author-heads"),
-            "rocksdb_author_head_reads":cfg!(feature="rocksdb-author-head-reads"),
-            "rocksdb_coverless":cfg!(feature="rocksdb-coverless"),
+            "rocksdb_author_heads":true,
+            "rocksdb_author_head_reads":true,
+            "rocksdb_coverless":true,
             "rocksdb_read_diagnostics":cfg!(feature="rocksdb-read-diagnostics")
         }),
     );
@@ -1476,7 +1473,6 @@ fn decorate_frontier_report(report: &mut Value) {
     object.insert("limits".into(),json!("Named operations and actual query outcome classifications only. No timing/network/device-I/O/15M performance or matched cross-round claim. Work/counters are observations; a logical-work delta requires review before any paired-savings interpretation. Strict equality requires both completed Samples, exact ordered IDs and packed/encoded-payload/decoded-body hashes+lengths, equal final hints and no payload failure. Partial Samples retain available state and are ineligible; a failed read_arm loses its in-flight Sample/counters but retains error metadata, the available opposite Sample and prior pairs. Expected outcome lists and status precedence remain explicit. Valid-record parity does not promise identical incidental corruption detection outside a skipped lookahead boundary; full offline audit is separate. Host owns input/copy/binary/source/native/archive/layout/audit/resource/lifecycle provenance and authorization."));
 }
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 fn diagnose_author_frontiers(
     database: &Path,
     filters: &Path,
@@ -1494,7 +1490,6 @@ fn diagnose_author_frontiers(
     )
 }
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 #[test]
 #[ignore = "requires separately authorized same-v3 disposable database and exact retained feed metadata"]
 fn diagnose_existing_seed_author_frontiers() {
@@ -1516,6 +1511,5 @@ fn diagnose_existing_seed_author_frontiers() {
     );
 }
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 #[path = "author_frontier_seed_tests.rs"]
 mod author_frontier_seed_tests;

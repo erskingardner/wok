@@ -99,6 +99,55 @@ class CampaignTests(unittest.TestCase):
                 **{key: 0 for key in ["rejected_writes", "unanswered_writes", "unsent_writes", "unanswered_reads", "unsent_reads",
                                       "query_mismatches", "protocol_errors", "postcheck_mismatches"]}}
 
+    def queried_report(self):
+        report = self.report()
+        report.update(matched_writer_authors="queried", history_cutoff=9999)
+        overlap = {shape: {"plans":64,"author_filter_plans":64,"plans_with_writer_authors":64,
+                           "minimum_writer_authors":1,"maximum_writer_authors":16}
+                   for shape in ["author","feed500"]}
+        overlap.update({shape: {"plans":64,"author_filter_plans":0,"plans_with_writer_authors":0,
+                               "minimum_writer_authors":None,"maximum_writer_authors":None}
+                        for shape in ["tag","id"]})
+        report["workload"] = {key:report[key] for key in ["corpus_sha256","query_plan_sha256",
+            "history_cutoff","seed","offered_writes","write_rate","read_rate","read_connections",
+            "publish_connections","drain_secs","matched_writer_authors"]}
+        report["workload"].update(format="network-matched-queried-authors-v1",writer_authors={
+            "mode":"queried","author_count":64,"pubkey_set_sha256":"a"*64,
+            "timed_event_ids_sha256":"b"*64,"query_shape_overlap":overlap})
+        self.rehash_workload(report)
+        return report
+
+    def rehash_workload(self, report):
+        raw=M.json.dumps(report["workload"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+        report["workload_sha256"]=M.hashlib.sha256(raw).hexdigest()
+
+    def test_default_writer_mode_preserves_command_and_accepts_legacy_report(self):
+        self.assertEqual(M.matched_writer_arguments("disjoint"),[])
+        self.assertEqual(M.matched_writer_arguments("queried"),["--matched-writer-authors","queried"])
+        M.validate_writer_workload(self.report(),"disjoint")
+        with self.assertRaises(AssertionError):M.validate_writer_workload(self.report(),"queried")
+
+    def test_queried_writer_mode_hash_and_overlap_cannot_be_mixed_or_tampered(self):
+        report=self.queried_report()
+        M.validate_network(report,1000,250,100,"corpus","queries",matched_writer_authors="queried")
+        with self.assertRaises(AssertionError):M.validate_writer_workload(report,"disjoint")
+        for field in ["hash","seed","missing_feed","wrong_author_count"]:
+            changed=copy.deepcopy(report)
+            if field=="hash":changed["workload_sha256"]="0"*64
+            if field=="seed":changed["workload"]["seed"]+=1
+            if field=="missing_feed":changed["workload"]["writer_authors"]["query_shape_overlap"]["feed500"]["plans_with_writer_authors"]=0
+            if field=="wrong_author_count":changed["workload"]["writer_authors"]["author_count"]=32
+            if field!="hash":self.rehash_workload(changed)
+            with self.subTest(field=field),self.assertRaises(AssertionError):
+                M.validate_writer_workload(changed,"queried")
+
+    def test_predecessor_cannot_change_writer_authors(self):
+        old={"binaries":{arm:arm for arm in M.ARMS},"bench_binary_sha256":"driver",
+             "wok_template_sha256":"config","fastr_environment":{},"options":{"events":80000}}
+        new=copy.deepcopy(old);new["options"]["matched_writer_authors"]="queried"
+        with self.assertRaisesRegex(AssertionError,"workload/options"):
+            M.validate_predecessor_identity(old,new,rerun_network=False,rerun_arms=[])
+
     def check_report(self, report):
         return M.validate_network(report, 1000, 250, 100, "corpus", "queries", corpus_events=12000, seed=257, drain_secs=120)
 

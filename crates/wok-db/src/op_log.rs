@@ -10,7 +10,7 @@
 //! - `D dbi:u32 klen:u32 key has_val:u8 [vlen:u32 val]`: a delete that
 //!   removed something. Deleting every duplicate of a key is logged as one
 //!   record per duplicate, so a replay needs no reads.
-//! - `X dbi:u32`: a table was cleared.
+//! - `X dbi:u32`: a table was cleared (historical logs; RocksDB logs its deletes).
 //! - `C`: the transaction holding the records since the last `C` committed.
 //!   Aborted transactions leave no records.
 //! - `H len:u16 label`: a phase marker from the caller.
@@ -160,9 +160,4 @@ pub(crate) fn del(buf: &mut Vec<u8>, dbi: MDB_dbi, key: &[u8], val: Option<&[u8]
         }
         None => buf.push(0),
     }
-}
-
-pub(crate) fn clear(buf: &mut Vec<u8>, dbi: MDB_dbi) {
-    buf.push(b'X');
-    buf.extend_from_slice(&dbi.to_le_bytes());
 }

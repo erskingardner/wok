@@ -1,4 +1,3 @@
-#![cfg(feature = "rocksdb-backend")]
 //! Physical layouts stay separate; authoritative bytes and writer semantics do not.
 
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
@@ -15,7 +14,7 @@ const FORMAT_KEY: &[u8] = b"wok-rocksdb-format";
 const DUAL: &[u8] = b"wok-rocks-v1:combined:dual-author:reverse-order:sync-wal";
 const COVERLESS: &[u8] = b"wok-rocks-v2:combined:thin-author:reverse-order:sync-wal";
 const HEADS: &[u8] = b"wok-rocks-v3:combined:thin-author-frontiers:reverse-order:sync-wal";
-const IS_COVERLESS: bool = cfg!(feature = "rocksdb-coverless");
+const IS_COVERLESS: bool = true;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Layout {
@@ -23,13 +22,7 @@ enum Layout {
     Coverless,
     Heads,
 }
-const CURRENT: Layout = if cfg!(feature = "rocksdb-author-heads") {
-    Layout::Heads
-} else if IS_COVERLESS {
-    Layout::Coverless
-} else {
-    Layout::Dual
-};
+const CURRENT: Layout = Layout::Heads;
 fn marker(layout: Layout) -> &'static [u8] {
     match layout {
         Layout::Dual => DUAL,

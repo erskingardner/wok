@@ -24,14 +24,14 @@ pub const CLOSE_INVALID_DATA: u16 = 1007;
 pub const CLOSE_TOO_BIG: u16 = 1009;
 
 fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
-    let mut chunks = payload.chunks_exact_mut(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = payload.as_chunks_mut::<4>();
+    for chunk in chunks {
         chunk[0] ^= mask[0];
         chunk[1] ^= mask[1];
         chunk[2] ^= mask[2];
         chunk[3] ^= mask[3];
     }
-    for (byte, mask) in chunks.into_remainder().iter_mut().zip(mask) {
+    for (byte, mask) in remainder.iter_mut().zip(mask) {
         *byte ^= mask;
     }
 }

@@ -7,7 +7,8 @@ it is not a promise to reproduce upstream bugs.
 ## Storage and migration
 
 - strfry LMDB v3 is read only through `wok migrate strfry`. Normal Wok
-  commands require a Wok-owned database marker (currently v5).
+  commands require the Wok-owned RocksDB format and logical marker (currently v5).
+  Wok LMDB v4/v5 is also an offline read-only migration source.
 - Migration preserves exact Event and EventPayload records and checks their
   fingerprint. Wok does not promise that strfry can reopen the result.
 - Supported source settings are translated from strfry HOCON into strict Wok
@@ -31,7 +32,7 @@ it is not a promise to reproduce upstream bugs.
 - `wok event <levId>` prints one event by local event ID.
 - NIP-11 `software` is Wok's homepage, `https://github.com/erskingardner/wok`.
 - Wok implements NIP-50 ranked search of text kinds and profiles using a
-  Wok-owned derived LMDB index. The pinned strfry revision has no NIP-50
+  Wok-owned derived index. The pinned strfry revision has no NIP-50
   implementation.
 - Wok returns mergeable NIP-45 HyperLogLog sketches for canonical
   single-target COUNT filters, including address and hashed-string offsets;
@@ -40,7 +41,7 @@ it is not a promise to reproduce upstream bugs.
   knows them; see [nips.md](nips.md). The pinned strfry revision sends a
   two-element EOSE.
 - Wok serves the NIP-86 management API (ban/allow/block/role methods backed
-  by a Wok-owned LMDB moderation table) and NIP-56 report queueing. The
+  by a Wok-owned moderation table) and NIP-56 report queueing. The
   pinned strfry revision delegates all such decisions to write-policy
   plugins and has no management endpoint.
 
@@ -69,7 +70,7 @@ it is not a promise to reproduce upstream bugs.
   Rejected writes do not apply proposed physical cleanup.
 - Ephemeral kinds are live-only by default: after validation, AUTH, and policy
   checks they reach matching active subscriptions without being written to
-  LMDB or negentropy. Operators can explicitly select `ttl` compatibility mode,
+  storage or negentropy. Operators can explicitly select `ttl` compatibility mode,
   and migrated historical ephemeral records continue to age out through cron.
 - A REQ is registered with the live monitor before its history is scanned
   (see [architecture.md](architecture.md#req-lifecycle)). Pinned strfry
@@ -343,15 +344,16 @@ regression test. Differential parity alone is not a reason to retain it.
   specified lowercase hex form.
 - Event kinds are limited to 0 through 65535, every tag element must be a
   string, and `a`-tag kind/pubkey parsing follows those same constraints.
-- LMDB no longer accidentally enables `MDB_NOMETASYNC` by passing the
-  same-valued DBI-only `MDB_CREATE` flag when opening the environment.
+- Runtime commits use RocksDB synchronous WAL batches. LMDB is read-only
+  import code; it never opens a source with writable environment flags.
 - Custom LMDB comparators are total for malformed keys and never panic across
   their C ABI boundary; valid v3/v4/v5 key ordering remains unchanged.
 
 - Wok v5 adds transactional author counters and a monotonic local event
-  sequence in `wok_State`. Opening a v4 database for normal Wok writes upgrades
-  its marker atomically; signed records and payloads are not rewritten. Counters
-  initialize per author on first mutation. Older Wok writers refuse v5.
+  sequence in `wok_State`. Offline migration from Wok LMDB v4 normalizes the
+  destination marker to v5 without rewriting signed records or payloads. Normal
+  runtime opens refuse LMDB; counters initialize lazily and older Wok writers
+  cannot share the RocksDB layout.
 - All read paths, including COUNT/HLL and NIP-77 ID reconciliation, enforce
   the same first-recipient/author policy, moderation, vanish and expiry checks.
   Multiple successfully authenticated identities remain valid on one connection

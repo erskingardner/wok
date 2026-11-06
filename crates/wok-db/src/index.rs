@@ -11,12 +11,11 @@ use crate::DbError;
 
 enum Prefix<'a> {
     Logical(&'a [u8]),
-    #[cfg(feature = "rocksdb-backend")]
+
     InvertedEscaped(&'a [u8]),
 }
 
 enum LocalId<'a> {
-    #[cfg(feature = "rocksdb-backend")]
     Integer(u64),
     Logical(&'a [u8]),
 }
@@ -49,7 +48,6 @@ impl<'a> IndexEntry<'a> {
     /// able to reject an unrelated prefix/time before examining its duplicate.
     pub fn local_id(&self) -> Result<u64, DbError> {
         match self.local_id {
-            #[cfg(feature = "rocksdb-backend")]
             LocalId::Integer(id) => Ok(id),
             LocalId::Logical(bytes) => u64_from_ne_checked(bytes),
         }
@@ -63,7 +61,7 @@ impl<'a> IndexEntry<'a> {
                 offset += 1;
                 Some(byte)
             }
-            #[cfg(feature = "rocksdb-backend")]
+
             Prefix::InvertedEscaped(bytes) => {
                 let byte = !*bytes.get(offset)?;
                 offset += 1;
@@ -129,7 +127,6 @@ impl<'a> IndexEntry<'a> {
         key
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     pub(crate) fn from_matching_rocks(
         dbi: u32,
         raw: &[u8],
@@ -165,7 +162,6 @@ impl<'a> IndexEntry<'a> {
         })
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     pub(crate) fn from_rocks(dbi: u32, raw: &'a [u8]) -> Option<Self> {
         fn integer(raw: &[u8]) -> Option<u64> {
             let bytes: [u8; 8] = raw.try_into().ok()?;
@@ -232,21 +228,4 @@ where
     cursor.foreach_full(start_key, &start_dup.to_ne_bytes(), true, |key, value| {
         callback(IndexEntry::from_logical(key, value))
     })
-}
-
-#[cfg(not(feature = "rocksdb-backend"))]
-impl Cursor<'_> {
-    /// Independently position and scan newest-first index postings. Returned
-    /// entries borrow the current cursor record only for the callback.
-    pub fn foreach_index<F>(
-        &mut self,
-        start_key: &[u8],
-        start_dup: u64,
-        callback: F,
-    ) -> Result<bool, DbError>
-    where
-        F: FnMut(IndexEntry<'_>) -> bool,
-    {
-        foreach_logical(self, start_key, start_dup, callback)
-    }
 }

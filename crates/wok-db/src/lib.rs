@@ -1,22 +1,19 @@
-//! Wok's LMDB storage and the read-only strfry v3 migration boundary.
+//! Wok's RocksDB storage and the read-only LMDB migration boundary.
 //!
 //! # Transaction safety
 //!
-//! LMDB transactions, cursors, and mmap-backed slices obtained from this crate
+//! Database transactions, cursors, and borrowed slices obtained from this crate
 //! must never cross a Tokio `.await` point. Callers should run database work on
 //! dedicated OS threads and copy results into owned values before awaiting.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
-#[cfg(feature = "rocksdb-backend")]
 #[path = "migration/backend.rs"]
 pub mod backend_migration;
 pub mod backup;
 pub mod comparators;
 mod deletion_protection;
-#[cfg(not(feature = "rocksdb-backend"))]
-pub mod env;
-#[cfg(feature = "rocksdb-backend")]
+
 #[path = "rocks/env.rs"]
 pub mod env;
 pub mod error;
@@ -35,26 +32,24 @@ pub mod purge;
 #[cfg(feature = "rocksdb-read-diagnostics")]
 pub mod read_diagnostics;
 pub mod reindex;
-#[cfg(feature = "rocksdb-backend")]
+
 mod rocks;
 pub mod schema;
 pub mod search;
 pub mod tag_kind;
-#[cfg(not(feature = "rocksdb-backend"))]
-pub mod txn;
-#[cfg(feature = "rocksdb-backend")]
+
 #[path = "rocks/txn.rs"]
 pub mod txn;
 pub mod vanish;
 pub mod write;
 
-#[cfg(feature = "rocksdb-backend")]
 pub use backend_migration::{
-    inspect_lmdb_source, migrate_lmdb_to_rocksdb, LmdbSourceReport, LmdbTableInfo,
-    LmdbTableVerification, LmdbToRocksOptions, LmdbToRocksReport,
+    audit_strfry_source, inspect_lmdb_source, inspect_strfry_source, migrate_lmdb_to_rocksdb,
+    migrate_strfry_to_rocksdb, LmdbSourceReport, LmdbTableInfo, LmdbTableVerification,
+    LmdbToRocksOptions, LmdbToRocksReport, StrfrySourceAudit,
 };
 pub use deletion_protection::is_deletion_protected_json;
-pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
+pub use env::{Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;
 pub use fbs::{
     decode_compression_dictionary, decode_meta, decode_negentropy_filter,
@@ -73,8 +68,7 @@ pub use lookup::{
 };
 pub use migration::{
     event_fingerprint, event_fingerprint_excluding, event_fingerprint_without_hashed_tag_values,
-    snapshot_lmdb_readonly, verify_events, EventFingerprint, EventVerificationFailure,
-    EventVerificationReport,
+    verify_events, EventFingerprint, EventVerificationFailure, EventVerificationReport,
 };
 pub use moderation::{
     allow_event, allow_kind, allow_pubkey, allowed_pubkey_reason_ro, assign_role, ban_event,
@@ -94,7 +88,7 @@ pub use payload::{
 };
 pub use purge::{count_superseded_ro, purge_superseded, SupersededHistory};
 pub use reindex::{rebuild_primary_and_event_indices, PackedEventRebuild, ReindexStats};
-#[cfg(feature = "rocksdb-author-heads")]
+
 pub use rocks::author_heads::{AuthorHead, AuthorPosition};
 pub use schema::{dbi_specs, DBI_NAMES};
 pub use search::{
@@ -128,15 +122,8 @@ pub mod state;
 #[cfg(test)]
 mod crash_tests;
 
-/// Storage format used by this binary. The optional RocksDB build cannot open LMDB files.
+/// The sole supported runtime storage format. The identity is retained so
+/// existing verified v3 RocksDB databases and benchmark evidence stay compatible.
 pub fn storage_backend_name() -> &'static str {
-    if cfg!(feature = "rocksdb-author-heads") {
-        "rocksdb-author-heads-experimental"
-    } else if cfg!(feature = "rocksdb-coverless") {
-        "rocksdb-coverless-experimental"
-    } else if cfg!(feature = "rocksdb-backend") {
-        "rocksdb-optimized-experimental"
-    } else {
-        "lmdb"
-    }
+    "rocksdb-author-heads-experimental"
 }

@@ -41,7 +41,8 @@ preset = "public"
 # description = "A public Nostr relay."
 # contact = "mailto:ops@example.com"
 
-# Where the database lives. The default is ./wok-db/.
+# Where the RocksDB runtime lives. The default is ./wok-db/.
+# Existing LMDB needs explicit offline migration to a new directory.
 # [database]
 # path = "/var/lib/wok/db"
 

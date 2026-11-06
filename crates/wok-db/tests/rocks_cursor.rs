@@ -1,4 +1,3 @@
-#![cfg(feature = "rocksdb-backend")]
 //! Snapshot cursor traversal, including recovery after unsuccessful operations.
 
 use lmdb_sys::*;

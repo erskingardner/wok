@@ -227,7 +227,6 @@ fn author_index_order_resume_and_work_match() {
     }
 }
 
-#[cfg(feature = "rocksdb-coverless")]
 #[test]
 fn coverless_public_author_and_feed_plans_use_thin_postings() {
     let (_dir, env, events) = store((1..=300).map(|n| event(n, n % 3, 1, 0, &[])).collect());
@@ -479,13 +478,6 @@ fn knob(name: &str, default: usize) -> usize {
 #[test]
 #[ignore]
 fn author_index_causal_diagnostic() {
-    if matches!(
-        wok_db::storage_backend_name(),
-        "lmdb" | "rocksdb-coverless-experimental"
-    ) {
-        println!("This layout aliases the two author DBIs; no distinct physical index comparison");
-        return;
-    }
     let rows = knob("AUTHOR_INDEX_ROWS", 10_000);
     let runs = knob("AUTHOR_INDEX_RUNS", 21);
     let payload_bytes = knob("AUTHOR_INDEX_PAYLOAD_BYTES", 1024);

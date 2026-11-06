@@ -8,7 +8,7 @@ use bumpalo::Bump;
 use elsa::FrozenMap;
 use lmdb_sys::*;
 use std::cell::OnceCell;
-#[cfg(any(not(feature = "rocksdb-coverless"), feature = "rocksdb-author-heads"))]
+
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -288,11 +288,7 @@ pub struct RwTxn<'env> {
     staged: Overlay,
     counts: HashMap<u32, u64>,
     marker_values: MarkerMap,
-    #[cfg(not(feature = "rocksdb-coverless"))]
-    touched_records: HashSet<u64>,
-    #[cfg(not(feature = "rocksdb-coverless"))]
-    touched_postings: HashSet<Vec<u8>>,
-    #[cfg(feature = "rocksdb-author-heads")]
+
     touched_authors: HashSet<[u8; 32]>,
     _writer: MutexGuard<'env, ()>,
     pub(crate) event_sequence: Option<u64>,
@@ -306,7 +302,6 @@ impl<'env> RoTxn<'env> {
     /// Read tiny derived author heads in this transaction's snapshot. Results
     /// preserve input order and duplicates; no primary records enter the cache.
     /// A missing head is not proof that the author has no matching history.
-    #[cfg(feature = "rocksdb-author-heads")]
     pub fn author_heads<'a>(
         &self,
         authors: impl IntoIterator<Item = &'a [u8; 32]>,
@@ -418,11 +413,7 @@ impl<'env> RwTxn<'env> {
             marker_values,
             staged: BTreeMap::new(),
             counts: HashMap::new(),
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            touched_records: HashSet::new(),
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            touched_postings: HashSet::new(),
-            #[cfg(feature = "rocksdb-author-heads")]
+
             touched_authors: HashSet::new(),
             _writer: guard,
             event_sequence: None,
@@ -545,21 +536,13 @@ impl<'env> RwTxn<'env> {
                 record.payload = Some(val.to_vec());
             }
             self.staged.insert((3, pk), Some(record.encode()));
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            self.touched_records.insert(u64::from_ne_bytes(
-                key.try_into().map_err(|_| err("invalid local ID"))?,
-            ));
-            #[cfg(feature = "rocksdb-coverless")]
+
             let _ = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid local ID"))?);
         } else {
-            #[cfg(feature = "rocksdb-author-heads")]
             if dbi == 10 && key.len() == 40 {
                 self.touched_authors.insert(key[..32].try_into().unwrap());
             }
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            if dbi == 10 {
-                self.touched_postings.insert(pk.clone());
-            }
+
             self.staged
                 .insert((dbi, pk), Some(if dup { Vec::new() } else { val.to_vec() }));
         }
@@ -628,24 +611,17 @@ impl<'env> RwTxn<'env> {
                     Some(record.encode())
                 },
             );
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            self.touched_records.insert(u64::from_ne_bytes(
-                key.try_into().map_err(|_| err("invalid local ID"))?,
-            ));
-            #[cfg(feature = "rocksdb-coverless")]
+
             let _ = u64::from_ne_bytes(key.try_into().map_err(|_| err("invalid local ID"))?);
         } else {
             if self.view.raw(dbi, &pk, Some(&self.staged))?.is_none() {
                 return Ok(false);
             }
-            #[cfg(feature = "rocksdb-author-heads")]
+
             if dbi == 10 && key.len() == 40 {
                 self.touched_authors.insert(key[..32].try_into().unwrap());
             }
-            #[cfg(not(feature = "rocksdb-coverless"))]
-            if dbi == 10 {
-                self.touched_postings.insert(pk.clone());
-            }
+
             self.staged.insert((dbi, pk), None);
         }
         self.change_count(dbi, false)?;
@@ -684,50 +660,7 @@ impl<'env> RwTxn<'env> {
         }
         Ok(())
     }
-    #[cfg(not(feature = "rocksdb-coverless"))]
-    fn refresh_covers(&mut self) -> Result<(), DbError> {
-        let mut keys = std::mem::take(&mut self.touched_postings);
-        for &id in &self.touched_records {
-            let k = id.to_ne_bytes();
-            let pk = encode(3, &k, None);
-            for staged in [None, Some(&self.staged)] {
-                if let Some(raw) = self.view.raw(3, &pk, staged)? {
-                    if let Some(packed) = parts(&raw)?.0 {
-                        let Ok(event) = wok_event::PackedEventView::new(packed) else {
-                            continue;
-                        };
-                        keys.insert(encode(
-                            10,
-                            &crate::keys::make_key_string_u64(event.pubkey(), event.created_at()),
-                            Some(&k),
-                        ));
-                    }
-                }
-            }
-        }
-        for pk in keys {
-            let present = self.view.raw(10, &pk, Some(&self.staged))?.is_some();
-            let value = if present {
-                let (_, id) = decode(10, &pk, &[])?;
-                // Raw maintenance/test transactions can intentionally expose damaged
-                // primaries. Keep the derived cover faithful, including missing parts;
-                // readers and the offline audit must observe, never hide, that damage.
-                let raw = if id.len() == 8 {
-                    self.view
-                        .raw(3, &encode(3, &id, None), Some(&self.staged))?
-                        .unwrap_or_else(|| Record::default().encode())
-                } else {
-                    Record::default().encode()
-                };
-                Some(raw)
-            } else {
-                None
-            };
-            self.staged.insert((COVER_DBI, pk), value);
-        }
-        Ok(())
-    }
-    #[cfg(feature = "rocksdb-author-heads")]
+
     fn head_updates(&self) -> Result<Vec<author_heads::HeadUpdate>, DbError> {
         let cf = self
             .view
@@ -787,8 +720,6 @@ impl<'env> RwTxn<'env> {
         #[cfg(test)]
         crate::crash_tests::checkpoint("write-before-flush");
         crate::state::flush(&mut self)?;
-        #[cfg(not(feature = "rocksdb-coverless"))]
-        self.refresh_covers()?;
         let mut batch = rocksdb::WriteBatch::default();
         for ((dbi, key), value) in &self.staged {
             match value {
@@ -796,7 +727,7 @@ impl<'env> RwTxn<'env> {
                 None => batch.delete_cf(self.view.cf(*dbi), key),
             }
         }
-        #[cfg(feature = "rocksdb-author-heads")]
+
         {
             let cf = self
                 .view

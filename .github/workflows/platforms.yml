@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.target }} / ${{ matrix.backend }}
+    name: ${{ matrix.target }} / RocksDB
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -23,48 +23,24 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            backend: lmdb
-            features: ''
-            storage_backend: lmdb
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            backend: lmdb
-            features: ''
-            storage_backend: lmdb
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            backend: lmdb
-            features: ''
-            storage_backend: lmdb
           - runner: macos-15
             target: aarch64-apple-darwin
-            backend: lmdb
-            features: ''
-            storage_backend: lmdb
-          # Native C++ canaries on Linux and macOS; tag builds cover both
-          # architectures on each OS without four native rebuilds per PR.
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            backend: rocksdb
-            features: '--features wok-cli/rocksdb'
-            storage_backend: rocksdb-author-heads-experimental
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            backend: rocksdb
-            features: '--features wok-cli/rocksdb'
-            storage_backend: rocksdb-author-heads-experimental
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_BUILD_JOBS: '2'
-      CARGO_TARGET_DIR: target/${{ matrix.backend }}
+      CARGO_TARGET_DIR: target
       RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@v6
       - name: Linux RocksDB compiler and libclang
-        if: matrix.backend == 'rocksdb' && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - name: macOS RocksDB libclang
-        if: matrix.backend == 'rocksdb' && runner.os == 'macOS'
+        if: runner.os == 'macOS'
         run: |
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
@@ -72,12 +48,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli ${{ matrix.features }}
+        run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
       - name: Native storage and transport behavior
-        run: cargo test --locked --target '${{ matrix.target }}' -p wok-db -p wok-query -p wok-unix -p wok-ws -p wok-compat -p wok-cli ${{ matrix.features }}
+        run: cargo test --locked --target '${{ matrix.target }}' -p wok-db -p wok-query -p wok-unix -p wok-ws -p wok-compat -p wok-cli
       - name: Smoke-test version metadata
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          binary="target/${{ matrix.backend }}/${{ matrix.target }}/release/wok"
+          binary="target/${{ matrix.target }}/release/wok"
           test "$("$binary" --version)" = "wok $version"
-          test "$("$binary" storage-backend)" = '${{ matrix.storage_backend }}'
+          test "$("$binary" storage-backend)" = rocksdb-author-heads-experimental

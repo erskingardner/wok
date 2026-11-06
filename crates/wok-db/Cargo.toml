@@ -4,27 +4,21 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Wok LMDB storage and verified strfry v3 migration"
+description = "Wok RocksDB storage and verified read-only LMDB migration"
 
 [features]
 # Log every committed write for replay on other engines (#257 item 12).
 op-log = []
-# Experimental full relay backend, isolated from the default LMDB build.
-rocksdb-backend = ["dep:rocksdb", "dep:bumpalo", "dep:elsa", "dep:fs2"]
 # Opt-in, synchronous read diagnostics. No hooks are compiled into ordinary builds.
-rocksdb-read-diagnostics = ["rocksdb-backend"]
-# Separate experimental physical layout, with only thin author postings.
-rocksdb-coverless = ["rocksdb-backend"]
-# Separate coverless physical layout with atomic newest-posting author heads.
-rocksdb-author-heads = ["rocksdb-coverless"]
+rocksdb-read-diagnostics = []
 
 [dependencies]
 rustix = { version = "1", features = ["fs"] }
 tempfile.workspace = true
-fs2 = { version = "0.4", optional = true }
-rocksdb = { version = "=0.25.0", optional = true, default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
-bumpalo = { version = "3.20", optional = true }
-elsa = { version = "1.11", optional = true }
+fs2 = "0.4"
+rocksdb = { version = "=0.25.0", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+bumpalo = "3.20"
+elsa = "1.11"
 flatbuffers.workspace = true
 libc.workspace = true
 lmdb-sys.workspace = true

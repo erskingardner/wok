@@ -14,7 +14,7 @@ Transports (`wok-ws`, `wok-unix`) hold a `RelayHandle` and send owned strings ov
 
 ## Invariants
 
-- LMDB work stays on OS threads. Outbound messages are owned `String`s; mmap borrows never enter Tokio channels.
+- Storage work stays on OS threads. Outbound messages are owned `String`s; borrowed records never enter Tokio channels.
 - Single application-level writer thread; slow clients fail `try_send` and are dropped when `max_pending_outbound_bytes` is exceeded.
 - Restricted-read REQ/NEG-OPEN require a *completed* NIP-42 AUTH when restriction is on (stricter than C++).
 - NIP advertisement is the typed catalog in `capabilities.rs`, not an arbitrary config list.

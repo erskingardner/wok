@@ -1,4 +1,3 @@
-#![cfg(not(feature = "rocksdb-backend"))]
 //! Actual CLI migration of a database created by the pinned C++ reference.
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -97,6 +96,7 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         .arg(&config)
         .args(["migrate", "strfry", "--db"])
         .arg(&db)
+        .arg("--confirm-relay-stopped")
         .arg("--output")
         .arg(&output)
         .output()
@@ -117,15 +117,9 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         data_before
     );
     assert_eq!(std::fs::read(&config).unwrap(), config_before);
-    let source = wok_db::Env::open(
-        &db,
-        wok_db::EnvOptions {
-            read_only: true,
-            create_dbis: false,
-            ..wok_db::EnvOptions::for_tests()
-        },
-    )
-    .unwrap();
+    let source = wok_db::audit_strfry_source(&db, true).unwrap();
+    assert!(source.integrity.ok());
+    assert!(source.event_verification.as_ref().unwrap().ok());
     let target = wok_db::Env::open(
         output.join("db"),
         wok_db::EnvOptions {
@@ -135,10 +129,10 @@ fn cli_migrates_cpp_database_without_mutating_source_or_event_identity() {
         },
     )
     .unwrap();
-    assert_eq!(source.db_version().unwrap(), 3);
+    assert_eq!(source.source.db_version, 3);
     assert_eq!(target.db_version().unwrap(), wok_event::WOK_DB_VERSION);
     assert_eq!(
-        wok_db::event_fingerprint(&source).unwrap(),
+        source.fingerprint,
         wok_db::event_fingerprint(&target).unwrap()
     );
     let txn = target.begin_ro().unwrap();

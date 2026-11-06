@@ -1,100 +1,90 @@
 # Releases
 
-Wok uses Semantic Versioning and `vMAJOR.MINOR.PATCH` Git tags. The workspace
-version in `Cargo.toml`, the tag without its `v` prefix, and the dated section
-in `CHANGELOG.md` must agree.
+Wok uses Semantic Versioning and `vVERSION` Git tags. The workspace version in
+`Cargo.toml`, the tag without `v`, and the dated section in `CHANGELOG.md` must
+agree. Release candidates use a SemVer prerelease suffix such as `0.8.0-rc.1`.
+Preparing a candidate does not publish it or create a tag.
 
 ## Preparing a release
 
-1. Move the relevant entries from `Unreleased` into a new dated changelog
-   section, then add a fresh `Unreleased` section.
-2. Set `[workspace.package].version` in `Cargo.toml`. Every crate inherits this
-   single version.
-3. Run the normal CI commands and the RocksDB feature gate, then merge or push
-   the release commit. LMDB remains the default build; `--features rocksdb`
-   selects the optimized RocksDB layout and author-frontier reader.
-4. Wait for CI and distribution-platform builds to pass for that exact commit.
-5. Tag the exact release commit and push only that tag:
+1. Move the relevant `Unreleased` entries into a dated section and set the
+   workspace version. Every crate inherits it.
+2. Run normal CI, native platform tests, read-only import compatibility and
+   recovery checks for that exact candidate.
+3. Merge or push the reviewed commit, then wait for all required checks.
+4. Only when publishing is authorized, tag the exact commit and push the tag:
 
-   ```bash
-   version=0.2.0
+   ```sh
+   version=0.8.0-rc.1
    git tag -a "v$version" <release-commit> -m "Wok $version"
    git push origin "v$version"
    ```
 
-The tag push starts `.github/workflows/release.yml`. It independently validates
-the tag/version/changelog contract and tests both backends, builds separate
-native Wok binaries for Linux x86-64 and ARM64 plus macOS Intel and Apple Silicon, creates
-checksums, and publishes a GitHub Release for that tag. It never moves or
-creates a tag itself.
+`scripts/release-version.py` validates strict SemVer, `check-release.sh` checks
+version/changelog consistency, and `release-notes.sh` extracts the exact section.
+`publish-release.sh` keeps tag verification and chooses prerelease/latest flags.
+The tag workflow tests the runtime and
+imports, builds native Linux x86-64/ARM64 and macOS Intel/Apple Silicon binaries,
+and publishes checksummed assets. Prerelease tags produce GitHub prereleases
+without replacing the latest stable release. Stable tags publish stable releases.
+The workflow does not create or move tags itself.
 
-## Release assets
+## Assets and builds
 
-Archives are named `wok-VERSION-BACKEND-TARGET.tar.gz`, with `BACKEND` set to
-`lmdb` or `rocksdb`. Each backend has its own build directory and upload name;
-RocksDB never replaces an LMDB release asset. The executable inside either
-archive is named `wok`. Run `wok storage-backend` to identify its storage build.
+There is one `wok-VERSION-TARGET.tar.gz` archive per target. Every executable is
+named `wok` and uses RocksDB; no backend feature or alternate LMDB asset is built.
+`wok storage-backend` identifies the storage layout without opening a database.
 
-Each archive contains `wok`, `BACKEND.json`, `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`,
-`SECURITY.md`, `LICENSE`, the example `wok.toml`, and the complete `docs/` tree
-so README links and the Wok logo remain available offline. `BACKEND.json`
-records the backend, feature selection, storage identity, version, target,
-source commit and compiler. `SHA256SUMS` covers all published archives. Wok
-currently uses Unix-specific process, signal, and socket APIs, so Windows
-artifacts are not published.
+Each archive includes `wok`, `BACKEND.json`, README/changelog/contributor/security
+files, the license, the sample `wok.toml` and the complete `docs/` tree.
+`BACKEND.json` records RocksDB identity, version, target, source commit and compiler;
+its feature list is empty for ordinary release builds. `SHA256SUMS` covers all
+published archives. Windows is not supported by Wok's Unix process/socket APIs.
 
-## Backend build gates
-
-The LMDB workspace retains Rust 1.85 as its minimum. The optional RocksDB build
-requires Rust 1.88 or newer, a C++ compiler and libclang for native bindings.
-The current RocksDB storage identity is `rocksdb-author-heads-experimental`;
-the release feature alias is `rocksdb`. The alias does not select RocksDB for
-default builds or convert an existing LMDB database in place.
-
-On Debian/Ubuntu, install `g++ clang libclang-dev`. On macOS, install LLVM
-(`brew install llvm`) and set `LIBCLANG_PATH="$(brew --prefix llvm)/lib"` if
-libclang is not found. Xcode's command-line tools provide the C/C++ compiler.
-Native RocksDB compilation is substantial; CI limits parallel build jobs to two.
+Rust 1.88+, a C/C++ toolchain and libclang are required. On Debian/Ubuntu install
+`g++ clang libclang-dev`. On macOS use Xcode's command-line tools and LLVM;
+set `LIBCLANG_PATH` to LLVM's `lib` directory if bindings cannot locate it.
+Native compilation is substantial; CI limits build jobs to two and test
+concurrency separately. LMDB is vendored only for read-only source imports.
+Prebuilt Linux binaries still need the host's C/C++ runtime (`libstdc++6` on
+Debian/Ubuntu); libclang is needed only to build from source.
 
 ```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked --features wok-cli/rocksdb -- -D warnings
-cargo test --workspace --locked --features wok-cli/rocksdb
-cargo build --release --locked -p wok-cli --features rocksdb --target-dir target/rocksdb
-target/rocksdb/release/wok storage-backend
+cargo build --release --locked -p wok-cli
+target/release/wok storage-backend
 ```
 
-Workspace feature tests include the RocksDB format, migration, author-frontier
-and recovery suites. The mandatory pinned C++ differential gate remains an
-LMDB import compatibility check; it does not claim that a RocksDB binary can
-directly read a strfry LMDB directory. Distribution checks retain all four
-LMDB platforms and add native RocksDB canaries on Linux x86-64 and macOS ARM64;
-tag builds cover both backends on all four targets.
+The pinned C++ differential job verifies direct strfry migration and event
+identity. Runtime tests cover the RocksDB format, author frontiers, queries,
+transport behavior, backups, full-state Wok LMDB conversion and crash recovery.
+Passing these checks is not proof of equal durability under storage power loss.
 
-The reliability workflow runs a three-minute canary for each backend and a
-weekly one-hour soak for each. Before changing the default backend, review the
-native suite, migration checks and complete soak artifacts for the exact
-candidate commit. The soak verifies receipts, stored bodies, a 500-author
-feed during same-author appends, graceful restart, and one SIGKILL recovery
-after acknowledged work. This is process-crash coverage, not power-loss or
-in-flight-write durability proof.
+## Reliability canary
 
-To run the one-hour RocksDB soak locally on Linux:
+A three-minute Linux canary runs on relevant changes; weekly/manual runs use a
+one-hour soak. It checks acknowledged bodies, a 500-author feed during appends
+to queried authors, live delivery, graceful restart and forced process death.
+Review complete correctness/resource artifacts for the candidate, rather than
+using a shared-runner throughput number as a release threshold.
 
 ```sh
-cargo build --release --locked -p wok-cli --features rocksdb --target-dir target/relay-rocksdb
-cargo build --release --locked -p wok-compat --example reliability_soak --target-dir target/soak-driver
-python3 scripts/reliability-soak.py --backend rocksdb \
-  --wok target/relay-rocksdb/release/wok \
-  --driver target/soak-driver/release/examples/reliability_soak \
-  --seconds 3600 --seed 4242 --out /tmp/wok-rocksdb-soak-1
+cargo build --release --locked -p wok-cli
+cargo build --release --locked -p wok-compat --example reliability_soak
+python3 scripts/reliability-soak.py \
+  --wok target/release/wok \
+  --driver target/release/examples/reliability_soak \
+  --seconds 3600 --seed 4242 --out /tmp/wok-soak-run-1
 ```
 
-Use a new output directory for each run. Artifacts, failed databases and logs
-are retained. The runner checks the binary's storage identity, samples all
-database files (including RocksDB WAL/SST files), and performs the full offline
-RocksDB audit after each stop and at the end. See [reliability.md](reliability.md)
-for workload and resource-limit interpretation.
+Choose a new output directory each time. Logs, failed databases and resource
+samples remain retained. The runner verifies storage identity, samples native
+WAL/SST files and performs full offline audits after stops. See
+[reliability.md](reliability.md) for workload and evidence limits.
 
-Do not reuse or move a published version tag. If a release needs correction,
-prepare a new patch version and changelog entry.
+Never reuse or move a published tag. Corrections require a new version and
+changelog entry. Existing Wok LMDB operators must use the explicit
+[offline migration](migration-to-rocksdb.md); changing the executable alone
+cannot convert their database.

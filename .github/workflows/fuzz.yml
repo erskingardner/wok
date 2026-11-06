@@ -33,9 +33,14 @@ jobs:
   ingress:
     name: ingress (address)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '2'
     steps:
       - uses: actions/checkout@v6
+      - name: RocksDB native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -50,13 +55,18 @@ jobs:
           restore-keys: ingress-corpus-${{ runner.os }}-
       - name: Seed protocol and size boundaries
         run: python3 fuzz/seed-corpus.py
+      - name: Fetch the locked fuzz dependency graph
+        run: cargo fetch --locked --manifest-path fuzz/Cargo.toml --target x86_64-unknown-linux-gnu
       - name: Run bounded ingress campaign
         run: |
           nightly_cargo="$(rustup which --toolchain nightly cargo)"
           nightly_rustc="$(rustup which --toolchain nightly rustc)"
-          CARGO="$nightly_cargo" RUSTC="$nightly_rustc" \
+          # cargo-fuzz has no --locked switch. Fetch the exact graph above,
+          # prevent network resolution here, and reject any lockfile rewrite.
+          CARGO_NET_OFFLINE=true CARGO="$nightly_cargo" RUSTC="$nightly_rustc" \
             cargo fuzz run ingress --target x86_64-unknown-linux-gnu \
               --sanitizer address -- -runs=10000 -max_len=2097152 -timeout=10 -rss_limit_mb=2048
+          git diff --exit-code -- fuzz/Cargo.lock
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v4

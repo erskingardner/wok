@@ -1,12 +1,18 @@
 # Relay functions reached in the `default` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 791
+## anonymous: 814
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
 <wok_db::env::Env>::available_disk_bytes
 <wok_db::index::IndexEntry>::from_logical
+<wok_db::index::IndexEntry>::from_matching_rocks
+<wok_db::index::IndexEntry>::from_matching_rocks::{closure}
+<wok_db::index::IndexEntry>::from_matching_rocks::{closure}::{closure}
+<wok_db::index::IndexEntry>::from_rocks
+<wok_db::index::IndexEntry>::from_rocks::integer
+<wok_db::index::IndexEntry>::from_rocks::integer::{closure}
 <wok_db::index::IndexEntry>::local_id
 <wok_db::index::IndexEntry>::matches_kind
 <wok_db::index::IndexEntry>::prefix_bytes
@@ -16,22 +22,49 @@
 <wok_db::moderation::ModerationView>::hides
 <wok_db::payload::Decompressor>::decode
 <wok_db::payload::Decompressor>::decode_rw
+<wok_db::rocks::Record>::decode
+<wok_db::rocks::Record>::encode
+<wok_db::rocks::Record>::encode::{closure}
+<wok_db::rocks::author_heads::AuthorHead>::encode
+<wok_db::rocks::author_heads::AuthorPosition>::encode
 <wok_db::search::Tag>::name_and_value
 <wok_db::txn::Cursor>::count
-<wok_db::txn::Cursor>::foreach_full::<wok_db::index::foreach_logical<<wok_query::scan::ScanCursor>::collect::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::index::foreach_logical<<wok_db::txn::RwTxn>::head_updates::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::search::build_search_index::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::state::author_count::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+<wok_db::txn::Cursor>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
+<wok_db::txn::Cursor>::foreach_index::<<wok_db::txn::RwTxn>::head_updates::{closure}>
 <wok_db::txn::Cursor>::foreach_index::<<wok_query::scan::ScanCursor>::collect::{closure}>
-<wok_db::txn::RoTxn>::cursor
+<wok_db::txn::Cursor>::foreach_index::<<wok_query::scan::ScanCursor>::collect::{closure}>::{closure}
+<wok_db::txn::RecordBytes as core::convert::AsRef<[u8]>>::as_ref
+<wok_db::txn::RecordStore as wok_db::txn::RecordCache>::cached
+<wok_db::txn::RecordStore as wok_db::txn::RecordCache>::cached::{closure}
+<wok_db::txn::RecordStore as wok_db::txn::RecordCache>::get
+<wok_db::txn::RecordStore as wok_db::txn::RecordCache>::get::{closure}
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
 <wok_db::txn::RoTxn>::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
+<wok_db::txn::RwTxn>::del::{closure}
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::search::build_search_index::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::state::author_count::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 <wok_db::txn::RwTxn>::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+<wok_db::txn::RwTxn>::head_updates::{closure}
 <wok_db::txn::RwTxn>::largest_integer_key
+<wok_db::txn::RwTxn>::put::{closure}
+<wok_db::txn::View>::get_record
+<wok_db::txn::View>::read_options
+<wok_db::txn::View>::read_options::{closure}
 <wok_db::vanish::VanishPolicy>::targets_this_relay_value
 <wok_db::vanish::VanishPolicy>::targets_this_relay_value::{closure}
 <wok_db::vanish::VanishPolicy>::targets_this_relay_value::{closure}::{closure}
@@ -498,22 +531,16 @@
 <wok_ws::frame::WsParser>::new
 <wok_ws::frame::WsParser>::try_parse_frame
 <wok_ws::frame::WsParser>::with_role
-wok_db::comparators::cmp_string_u64
-wok_db::comparators::cmp_u64_u64
-wok_db::comparators::lmdb_comparator_string_u64
-wok_db::comparators::lmdb_comparator_u64_u64
 wok_db::comparators::make_key_string_u64
 wok_db::comparators::make_key_string_u64_u64
 wok_db::comparators::parse_key_string_u64
 wok_db::comparators::u64_from_ne
 wok_db::comparators::u64_from_ne_checked
-wok_db::env::statvfs_u64::<u32>
-wok_db::env::statvfs_u64::<u64>
 wok_db::fbs::decode_negentropy_filter
 wok_db::fbs::get_bytes
 wok_db::fbs::get_string
-wok_db::index::foreach_logical::<<wok_query::scan::ScanCursor>::collect::{closure}>
-wok_db::index::foreach_logical::<<wok_query::scan::ScanCursor>::collect::{closure}>::{closure}
+wok_db::index::foreach_logical::<<wok_db::txn::RwTxn>::head_updates::{closure}>
+wok_db::index::foreach_logical::<<wok_db::txn::RwTxn>::head_updates::{closure}>::{closure}
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>
 wok_db::lookup::foreach_negentropy_filter::<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}
 wok_db::lookup::foreach_negentropy_filter_rw::<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>
@@ -525,6 +552,8 @@ wok_db::moderation::moderation_reason_ro
 wok_db::moderation::prefixed
 wok_db::payload::encode_raw_payload
 wok_db::payload::parse_payload
+wok_db::rocks::parts
+wok_db::rocks::parts::part
 wok_db::search::build_search_index
 wok_db::search::build_search_index::{closure}
 wok_db::search::build_search_index::{closure}::{closure}
@@ -563,28 +592,18 @@ wok_db::tag_kind::put_tag_kind_entries
 wok_db::tag_kind::tag_kind_key
 wok_db::tag_kind::tag_kind_keys
 wok_db::tag_kind::tag_kind_keys::{closure}
-wok_db::txn::foreach_cursor::<wok_db::index::foreach_logical<<wok_query::scan::ScanCursor>::collect::{closure}>::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::search::build_search_index::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::state::author_count::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::write::lookup_event_by_id::{closure}>
-wok_db::txn::foreach_cursor::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
-wok_db::txn::foreach_cursor::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
-wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
-wok_db::txn::foreach_full::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
-wok_db::txn::foreach_full::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
-wok_db::txn::foreach_full::<wok_db::search::build_search_index::{closure}>
-wok_db::txn::foreach_full::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
-wok_db::txn::foreach_full::<wok_db::state::author_count::{closure}>
-wok_db::txn::foreach_full::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
-wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
-wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
-wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
-wok_db::txn::position_reverse_dup
+wok_db::txn::foreach::<wok_db::index::foreach_logical<<wok_db::txn::RwTxn>::head_updates::{closure}>::{closure}>
+wok_db::txn::foreach::<wok_db::lookup::foreach_negentropy_filter<wok_relay::server::negentropy::run_negentropy::{closure}>::{closure}>
+wok_db::txn::foreach::<wok_db::lookup::foreach_negentropy_filter_rw<<wok_negentropy::cache::NegentropyFilterCache>::freshen_rw::{closure}>::{closure}>
+wok_db::txn::foreach::<wok_db::lookup::lookup_event_by_id_ro::{closure}>
+wok_db::txn::foreach::<wok_db::search::build_search_index::{closure}>
+wok_db::txn::foreach::<wok_db::search::search_postings<<wok_query::scan::SearchScan>::gather::{closure}>::{closure}>
+wok_db::txn::foreach::<wok_db::state::author_count::{closure}>
+wok_db::txn::foreach::<wok_db::write::foreach_replacement<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>::{closure}>
+wok_db::txn::foreach::<wok_db::write::lookup_event_by_id::{closure}>
+wok_db::txn::foreach::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
+wok_db::txn::foreach::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
+wok_db::txn::record_key
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
 wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
 wok_db::vanish::is_event_vanished_ro_with_json
@@ -672,6 +691,10 @@ wok_query::monitor::remove_from::<[u8; 32], [u8]>
 wok_query::monitor::remove_from::<alloc::boxed::Box<[u8]>, [u8]>
 wok_query::monitor::remove_from::<u64, u64>
 wok_query::monitor::swap_remove
+wok_query::scan::author_head_scan::eligible
+wok_query::scan::author_head_scan::enabled
+wok_query::scan::author_head_scan::initialize
+wok_query::scan::author_head_scan::physical
 wok_query::scan::plans_pubkey_kind
 wok_query::scan::plans_tag_kind
 wok_query::scan::slice_spent

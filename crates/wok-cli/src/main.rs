@@ -120,8 +120,7 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Verify every RocksDB primary, signature, covering record and table count offline
-    #[cfg(feature = "rocksdb-backend")]
+    /// Verify every RocksDB primary, signature, author frontier and table count offline
     RocksdbCheck,
     /// Inspect the configuration file
     Config {
@@ -197,9 +196,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    Compact {
-        output_file: PathBuf,
-    },
     Monitor,
     Dict {
         #[command(subcommand)]
@@ -249,6 +245,9 @@ enum MigrateCmd {
         /// Inspect source, translation, capacity, and runtime use without copying
         #[arg(long)]
         check: bool,
+        /// Confirm strfry and every other source user have been stopped
+        #[arg(long)]
+        confirm_relay_stopped: bool,
         /// Emit a machine-readable preflight report (requires --check)
         #[arg(long, requires = "check")]
         json: bool,
@@ -359,10 +358,13 @@ async fn main() -> Result<()> {
                     db,
                     output,
                     check,
+                    confirm_relay_stopped,
                     json,
                 } => {
                     if check {
                         migrate::check_strfry(&db, &config, &output, json)
+                    } else if !confirm_relay_stopped {
+                        bail!("stop strfry and every other source user, then pass --confirm-relay-stopped");
                     } else {
                         migrate::migrate_strfry(&db, &config, &output)
                     }
@@ -410,7 +412,7 @@ async fn main() -> Result<()> {
         Command::Relay => cmd_relay(cfg, config).await,
         Command::Info => cmd_info(&cfg),
         Command::Backup { output } => cmd_backup(&cfg, &output),
-        #[cfg(feature = "rocksdb-backend")]
+
         Command::RocksdbCheck => {
             let env = Env::open(
                 &cfg.db,
@@ -454,7 +456,6 @@ async fn main() -> Result<()> {
             dry_run,
         } => cmd_delete(&cfg, age, filter, dry_run),
         Command::PurgeSuperseded { dry_run, json } => cmd_purge_superseded(&cfg, dry_run, json),
-        Command::Compact { output_file } => cmd_compact(&cfg, &output_file),
         Command::Monitor => cmd_monitor(&cfg),
         Command::Dict { cmd } => cmd_dict(&cfg, cmd),
         Command::Negentropy { cmd } => cmd_neg(&cfg, cmd),
@@ -543,12 +544,10 @@ fn spawn_config_reload(path: PathBuf, handle: wok_relay::RelayHandle) {
 }
 
 async fn cmd_relay(cfg: Config, config_path: PathBuf) -> Result<()> {
-    let (major, minor, patch) = wok_db::lmdb_version();
     tracing::info!(
         storage_backend = wok_db::storage_backend_name(),
         preset = %cfg.preset,
         wok = env!("CARGO_PKG_VERSION"),
-        lmdb = %format_args!("{major}.{minor}.{patch}"),
         "starting relay"
     );
     let warnings = [
@@ -694,7 +693,7 @@ fn cmd_backup(cfg: &Config, output: &Path) -> Result<()> {
             max_readers: cfg.db_maxreaders,
             map_size: cfg.db_mapsize,
             no_read_ahead: cfg.db_no_read_ahead,
-            read_only: !cfg!(feature = "rocksdb-backend"),
+            read_only: false,
             create_dir: false,
             create_dbis: false,
             ..EnvOptions::default()
@@ -1275,16 +1274,6 @@ fn cmd_purge_superseded(cfg: &Config, dry_run: bool, json: bool) -> Result<()> {
             history.events,
             history.groups
         );
-    }
-    Ok(())
-}
-
-fn cmd_compact(cfg: &Config, output: &Path) -> Result<()> {
-    let env = open_env(cfg)?;
-    if output.as_os_str() == "-" {
-        env.compact_to_fd(1)?;
-    } else {
-        env.compact_to_path(output)?;
     }
     Ok(())
 }
@@ -2136,7 +2125,6 @@ mod main_tests {
             .filter_map(|line| line.strip_prefix("| `wok "))
             .filter_map(|rest| rest.split_once('`'))
             .map(|(command, _)| format!("wok {command}"))
-            .filter(|command| cfg!(feature = "rocksdb-backend") || command != "wok rocksdb-check")
             .collect();
         assert_eq!(
             commands, documented,

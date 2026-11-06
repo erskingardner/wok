@@ -25,25 +25,25 @@ it, the gate in front of it, and the work done before that gate.
   Stop the relay and all DB utilities first; promotion retains the original
   database as a sibling backup rather than modifying it in place.
 - Do not expose the Unix socket on a shared host without UID/GID policy and `0600` mode.
-- Database files (`data.mdb`, `lock.mdb`, `wok compact` output and the copy
-  `wok migrate strfry` takes) are created with mode `0640`, less the umask:
-  stored events include gift wraps and other recipient-only kinds. Files
-  created by earlier releases keep their mode, `0664` less the umask;
-  `chmod g-w,o= data.mdb lock.mdb` in the database directory narrows them.
+- Database directories and checkpoints contain gift wraps, recipient-only
+  events and administrative state. Keep them owned by the service account and
+  inaccessible to unrelated users. Migration staging is private; review ownership
+  before publishing the service. Legacy source files keep their original modes.
 
 ## Memory-safety boundary
 
-Safe crates forbid `unsafe` Rust. Crates that require operating-system or LMDB
+Safe crates forbid `unsafe` Rust. Crates that require operating-system or native storage
 FFI deny it by default and allow it only in the explicitly audited modules.
 `unsafe_op_in_unsafe_fn` is denied so every pointer dereference and FFI
 operation remains visible at the exact call site.
 
-The relay's unavoidable high-risk boundary is LMDB: environment, transaction,
-cursor, comparator, and mmap value pointers. Transaction and cursor wrappers
-are explicitly neither `Send` nor `Sync`; mmap-backed slices are tied to a
-live transaction/cursor anchor and cannot outlive it through the safe API. Raw
-transaction pointers are not exposed. Negentropy nodes use explicit native-
-endian field encoding rather than copying Rust struct memory.
+Native storage is a trust boundary: RocksDB owns runtime snapshots, iterators,
+pinned records and atomic write batches. Its Rust wrappers must preserve native
+lifetimes; Wok transactions and cursors do not cross asynchronous boundaries.
+LMDB/OS FFI is isolated for registered read-only source imports, never a runtime
+writer. Import mmap slices are tied to their source transaction/cursor and cannot
+outlive it through safe APIs. Raw transaction pointers are not public. Logical
+records use explicit integer encodings rather than copying Rust struct memory.
 
 Release builds use `panic = "abort"`, preventing unwinding across C callback
 frames. Comparator functions are total over arbitrary byte strings and have
@@ -62,7 +62,7 @@ rather than permanently ignored; the initial audit removed the unmaintained
 
 Fast property tests feed arbitrary data into strict JSON/event validation,
 protocol envelopes, WebSocket fragmentation and decompression, Negentropy
-frames, and modeled LMDB transaction sequences on every normal test run. A
+frames, and modeled storage transaction sequences on every normal test run. A
 separate libFuzzer target composes the public ingress parsers, inflating
 WebSocket messages with and without context takeover, and across the idle
 release that replays a takeover connection's history. Relevant master
@@ -77,8 +77,8 @@ an independent expected-set model. The Linux soak checks mixed publishing,
 queries, sync, slow subscribers, reconnects, resource budgets, and graceful
 restart. See [reliability validation](reliability.md) for exact coverage and limits.
 
-Storage recovery tests exhaust a deliberately small LMDB map and terminate a
-separate writer process after the event and secondary indexes have been
-modified but before commit. Each fixture reopens the environment and verifies
-that the failed transaction left no partial state; the process-crash fixture
-also runs the full database integrity checker against a committed baseline.
+Storage recovery tests terminate a separate writer process around transactional
+write boundaries, reopen the native database and verify that only complete
+committed state is visible. Migration tests verify exact source preservation,
+failed-copy markers and refusal to publish partial outputs. These are bounded
+process-crash tests, not power-loss or torn-write simulations.

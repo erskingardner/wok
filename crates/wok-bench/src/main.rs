@@ -116,6 +116,10 @@ struct Args {
     /// Multiplexed historical query WebSockets in matched_network.
     #[arg(long, default_value_t = 2)]
     read_connections: usize,
+    /// matched_network writer authors: legacy disjoint keys, or the actual
+    /// historical author-plan keys (same seed as matched_network_generate).
+    #[arg(long, value_enum, default_value = "disjoint")]
+    matched_writer_authors: matched_network::WriterAuthors,
     /// Seconds --scenario ws_publish_rate sends for.
     #[arg(long, default_value_t = 10)]
     send_secs: u64,
@@ -471,6 +475,11 @@ fn main() -> Result<()> {
         )
         .init();
     let mut args = Args::parse();
+    if args.matched_writer_authors == matched_network::WriterAuthors::Queried
+        && args.scenario.as_deref() != Some("matched_network")
+    {
+        anyhow::bail!("--matched-writer-authors queried requires --scenario matched_network");
+    }
     CLIENT_NODELAY.store(args.tcp_nodelay, std::sync::atomic::Ordering::Relaxed);
     if args.repetitions == 0 {
         anyhow::bail!("--repetitions must be at least 1");
@@ -1601,7 +1610,7 @@ impl EventFactory {
         let pubkey = hex::encode(key.x_only_public_key().0.serialize());
         let mut tags = vec![json!(["t", format!("tag-{}", i % 64)])];
         match kind {
-            1 if i % 5 == 0 => {
+            1 if i.is_multiple_of(5) => {
                 if let Some((event_id, parent_pubkey, _)) = &self.last_note {
                     tags.push(json!(["e", event_id, "", "reply"]));
                     tags.push(json!(["p", parent_pubkey]));

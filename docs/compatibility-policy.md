@@ -5,14 +5,17 @@ by strfry's implementation choices.
 
 ## Stable boundaries
 
-- **Migration:** a supported strfry v3 source can be copied into a verified,
-  Wok-owned database without changing its logical event records.
+- **Migration:** supported strfry v3 and Wok v4/v5 LMDB sources are read-only
+  inputs to an explicit offline RocksDB copy, preserving logical event records.
 - **Nostr wire protocol:** Wok targets the canonical NIPs it advertises. The
   conformance suite pins the specification revision used for each release.
 - **Event identity:** migration and normal processing must not silently alter a
   valid event's canonical ID, signature, tags, content, or stored payload.
-- **Operational rollback:** migration leaves source files untouched; rollback
-  uses that source or an explicit JSONL transfer, never a shared writable DB.
+- **Operational rollback:** migration preserves source authoritative data and
+  configuration; registered LMDB reader coordination can update `lock.mdb`.
+  The source is only a pre-cutover snapshot after new writes. Event JSON alone
+  cannot reconcile administrative state; no shared writable DB or automatic
+  reverse converter is promised.
 
 ## Not promised
 

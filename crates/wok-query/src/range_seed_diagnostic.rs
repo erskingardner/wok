@@ -229,7 +229,7 @@ fn read_arm(env: &Env, input: &Input, arm: Arm) -> Result<Sample, String> {
             Arm::LegacyMax => DbScan::new_planned(filter, &tx),
             Arm::DirectUntil => DbScan::new(filter, &tx),
         };
-        #[cfg(feature = "rocksdb-author-head-reads")]
+
         {
             // Preserve the original endpoint-only comparison in this harness.
             scan.author_head_reads = false;
@@ -419,7 +419,7 @@ fn diagnose(config: &Config) -> Result<Value, String> {
         "arm_query_executions":records.len(),"records":records,
         "all_pairs_equivalent":mismatches.is_empty(),"mismatched_pairs":mismatches,
         "harness_source_sha256":digest(include_bytes!("range_seed_diagnostic.rs")),
-        "storage_backend":wok_db::storage_backend_name(),"thin_author_feature":cfg!(feature="rocksdb-thin-author-reads"),
+        "storage_backend":wok_db::storage_backend_name(),"thin_author_feature":true,
         "digest_framing":"For each ordered hit: unsigned local-ID u64 big-endian, byte length u64 big-endian, exact bytes. Separate SHA-256 streams for packed, encoded payload and decoded body; an empty stream has the standard empty SHA-256.",
         "scope":"Fresh read transaction per arm/query; unchanged planner then legacyMAX versus direct inclusive-until endpoints; normal default-visibility DbQuery, limit50, completeness and payload decoding. Wall-clock interruption disabled. Instrumented planner/query/body-callback scope excludes Env/txn opening, stored-byte verification and teardown. Native and OS caches remain shared; alternating arm order does not reset caches.",
         "provenance":"Explicit input file and disposable-copy provenance belong to the host manifest. Representative/unshifted/lower-cutoff inputs are not asserted to be an exact historical timed pool.",

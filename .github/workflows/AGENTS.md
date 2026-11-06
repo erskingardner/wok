@@ -2,12 +2,12 @@
 
 | File | When | What |
 | --- | --- | --- |
-| `ci.yml` | every push/PR | fmt, clippy `-D warnings`, all workspace tests, mandatory pinned C++ migration, MSRV 1.85 check |
+| `ci.yml` | every push/PR | fmt, clippy `-D warnings`, RocksDB workspace tests, mandatory pinned C++ import, MSRV 1.88 check |
 | `platforms.yml` | master, PR | Native builds and behavioral tests: Linux x86_64/ARM64, macOS Intel/Apple Silicon |
 | `security.yml` | Cargo.toml/lock/deny.toml; weekly | `cargo-deny` via `deny.toml` |
 | `fuzz.yml` | crate/fuzz changes on master/PR; weekly Wednesday | Seeded AddressSanitizer ingress fuzz with corpus reuse |
-| `reliability.yml` | crate/soak changes on master/PR; weekly/manual | Three-minute canary; weekly one-hour Linux soak; portable Compose lab with result/archive tests |
+| `reliability.yml` | crate/soak changes on master/PR; weekly/manual | Three-minute RocksDB canary; weekly one-hour Linux soak; portable Compose lab with result/archive tests |
 | `reachability.yml` | crate/script/toolchain changes on master/PR; manual | `scripts/attack-surface-reach.py --check`: relay functions each caller reaches, per profile, against `crates/wok-compat/tests/reachability/` |
-| `release.yml` | tags `v*.*.*` | Validate contract, build archives, publish GitHub release |
+| `release.yml` | tags `v*.*.*` | Validate SemVer contract, build one archive per target, publish stable or non-Latest prerelease |
 
 Local equivalents: `cargo fmt/clippy/test` from the root `AGENTS.md`; `scripts/check-release.sh` before tagging.

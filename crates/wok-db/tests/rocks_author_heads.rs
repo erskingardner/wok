@@ -1,4 +1,3 @@
-#![cfg(feature = "rocksdb-author-heads")]
 //! The frontier is derived metadata; authoritative event/payload bytes stay exact.
 
 use secp256k1::{Keypair, SecretKey, SECP256K1};
@@ -409,6 +408,7 @@ fn malformed_frontier_lengths_and_non_descending_next_fail_without_primary_reads
         let txn = env.begin_ro().unwrap();
         #[cfg(feature = "rocksdb-read-diagnostics")]
         {
+            let b = author(&events[1]);
             let (result, m) =
                 wok_db::read_diagnostics::measure(|| txn.author_heads([&a, &b])).unwrap();
             assert!(result.is_err());

@@ -7,16 +7,8 @@ license.workspace = true
 description = "Nostr filters, index selection, and resumable scans"
 
 [features]
-# Build-only author read-plan experiment; both RocksDB indexes remain written.
-rocksdb-thin-author-reads = ["wok-db/rocksdb-backend"]
 # Build-only operation counters for focused native read diagnostics.
 rocksdb-read-diagnostics = ["wok-db/rocksdb-read-diagnostics"]
-# Separate layout experiment; keep the same thin read plan as the dual-index control.
-rocksdb-coverless = ["rocksdb-thin-author-reads", "wok-db/rocksdb-coverless"]
-# Separate frontier layout with the established range-seek reader as control.
-rocksdb-author-heads = ["rocksdb-coverless", "wok-db/rocksdb-author-heads"]
-# Opt-in wide-author initialization from that layout; ordinary builds stay off.
-rocksdb-author-head-reads = ["rocksdb-author-heads"]
 
 [dependencies]
 serde_json.workspace = true

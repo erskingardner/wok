@@ -8,7 +8,7 @@ or production capacity.
 
 | Workflow | Evidence |
 | --- | --- |
-| `ci.yml` | Formatting, Clippy, both-backend workspace tests (including benchmark correctness), Rust 1.85 LMDB and Rust 1.88 RocksDB compilation |
+| `ci.yml` | Formatting, Clippy, RocksDB workspace tests (including benchmark correctness), Rust 1.88 compilation |
 | `ci.yml` migration job | Builds pinned strfry `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`; verifies import, event identity, and actual CLI migration |
 | `platforms.yml` | Native release build, version check, storage/transport/compatibility/CLI tests on Linux x86-64/ARM64 and macOS Intel/Apple Silicon |
 | `fuzz.yml` | 10,000 AddressSanitizer ingress fuzz iterations, protocol-shaped seeds, 2 MiB input ceiling, corpus reuse, crash artifacts |
@@ -27,10 +27,10 @@ the fuzz workflow. Inputs are seeded at protocol and WebSocket length boundaries
 and retained between runs. This remains a bounded fuzz smoke test; iteration
 counts and exercised branches are not coverage of every possible input.
 
-On macOS, if every LMDB-backed test fails at `Env::open` with
-`Lmdb(28, "No space left on device")` even though the disk has space, the
-system POSIX semaphore table is full of leaked LMDB semaphores. See "LMDB
-semaphores on macOS" in `production-deployment.md`.
+On macOS, legacy LMDB import fixtures can encounter semaphore exhaustion even
+when disk space remains. This affects the read-only import boundary, not the
+RocksDB runtime. See "LMDB import semaphores on macOS" in
+`production-deployment.md`.
 
 The GitHub ruleset is separate from workflow configuration. Defining mandatory
 jobs within a workflow does not make passing checks a prerequisite for pushing
@@ -90,13 +90,10 @@ python3 scripts/reliability-soak.py \
   --seconds 3600 --seed 4242 --out /tmp/wok-soak-run-1
 ```
 
-LMDB is the default build and soak backend. To exercise the optimized RocksDB
-build, add `--features rocksdb` to the CLI build and `--backend rocksdb` to the
-runner. Use separate target/output directories for the two builds, as shown in
-[releases.md](releases.md). The runner checks `wok storage-backend` before
-starting; it refuses a binary whose backend does not match the requested run.
-RocksDB needs Rust 1.88+, a C++ compiler and libclang. The load driver itself
-speaks WS/Unix and does not choose the relay's storage backend.
+RocksDB is the sole runtime and soak backend; no feature or `--backend`
+selector is needed. The runner checks `wok storage-backend` before starting.
+Builds require Rust 1.88+, a C/C++ compiler and libclang. The separate load
+driver speaks WS/Unix and has no storage backend choice.
 
 Python 3.11+ and Linux `/proc` are required. The runner creates disposable storage
 and loopback listeners, never resets an existing database, and refuses to reuse
@@ -140,7 +137,7 @@ Mixed-workload events use the live clock and are not retained as a complete
 replay stream, so a seed alone does not reproduce every event byte.
 
 Database size counts all regular files below the owned database directory,
-including RocksDB WAL/SST files and LMDB data/lock files. Paths containing
+including RocksDB WAL/SST files. Paths containing
 symlinks are rejected; a file removed by compaction during a sample is skipped.
 These directory samples are not atomic storage snapshots. Sampled budgets are 768 MiB relay RSS and 512 MiB
 database size. Five-second
@@ -156,7 +153,7 @@ The config allows a 30,000-event query and 16 MiB per-connection outbound queue
 for this dataset. Rate limiting is disabled to isolate storage/transport
 reliability; admission-limit behavior is covered separately by integration tests.
 Fixtures retain the host's inherited file-descriptor limit (`nofiles = 0`).
-Normal synchronous LMDB commits or synchronous RocksDB WAL batches are retained.
+Normal synchronous RocksDB WAL batches are retained.
 These are workload budgets, not the storage engines' production memory limits.
 The resource cap does not cover
 the load driver's memory; container limits and host details are recorded.

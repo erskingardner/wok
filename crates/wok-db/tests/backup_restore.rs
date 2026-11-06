@@ -135,7 +135,7 @@ fn restored_backup_preserves_all_tables_and_is_independent_of_source_writes() {
             .permissions()
             .mode()
             & 0o777,
-        0o750
+        0o700
     );
 
     let mut txn = source.begin_rw().unwrap();
@@ -207,7 +207,6 @@ fn atomic_publication_never_replaces_an_existing_empty_directory() {
     );
 }
 
-#[cfg(feature = "rocksdb-backend")]
 #[test]
 fn readonly_rocksdb_backup_requires_an_exclusive_writable_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -221,17 +220,4 @@ fn readonly_rocksdb_backup_requires_an_exclusive_writable_open() {
         .to_string()
         .contains("exclusive writable"));
     assert!(!output.exists());
-}
-
-#[cfg(not(feature = "rocksdb-backend"))]
-#[test]
-fn readonly_lmdb_backup_does_not_require_a_writer() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("source");
-    drop(seed(&path));
-    let source = readonly(&path);
-    let before = records(&source);
-    let output = dir.path().join("backup");
-    source.backup_to_directory(&output).unwrap();
-    assert_eq!(before, records(&readonly(&output)));
 }

@@ -16,11 +16,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0-rc.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/erskingardner/wok"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"

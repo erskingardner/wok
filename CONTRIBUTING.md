@@ -10,8 +10,12 @@ Security problems go through [SECURITY.md](SECURITY.md), not public issues.
 
 `rust-toolchain.toml` pins the stable toolchain used for local builds and CI.
 `rustup` picks it up automatically. The minimum supported Rust version is
-1.85, and CI checks it separately, so don't use language or library features
+1.88, and CI checks it separately, so don't use language or library features
 newer than that.
+
+Every build uses RocksDB. Install a C/C++ toolchain and libclang for native
+bindings (`g++ clang libclang-dev` on Debian/Ubuntu; Xcode command-line tools
+and LLVM on macOS). LMDB is vendored only for read-only migration sources.
 
 ```bash
 cargo build --release -p wok-cli          # binary: target/release/wok
@@ -63,7 +67,7 @@ describing its modules. The short version:
 | Crate | Role |
 |---|---|
 | `wok-event` | Event JSON, NIP-01 hashing, signatures, packed events |
-| `wok-db` | LMDB storage, indexes, migration from strfry, integrity |
+| `wok-db` | RocksDB storage, indexes, read-only LMDB migration, integrity |
 | `wok-query` | Filters, scans, query scheduling, live subscriptions |
 | `wok-negentropy` | NIP-77 sync |
 | `wok-relay` | Transport-neutral relay core, AUTH, config |
@@ -76,18 +80,18 @@ CLI or tests.
 
 ## Rules the code follows
 
-- Tokio owns network I/O only. LMDB transactions, cursors and mmap slices never
+- Tokio owns network I/O only. Storage transactions, cursors and borrowed records never
   cross an `.await`. Copy data out before awaiting.
 - Inside the relay, one writer thread performs every database mutation.
-  Other `wok` commands that change the database, such as `import`, `delete`,
-  `purge-superseded` and `negentropy build`, write from their own process,
-  and LMDB runs only one write transaction at a time across processes.
-  `reindex` needs the relay and every other writer stopped.
+  RocksDB's exclusive writer-process lock prevents a separate `import`,
+  `delete`, `purge-superseded`, `backup` or maintenance process from sharing
+  the live database. Stop the relay before those operations. LMDB inputs are
+  read-only and explicit offline migration preserves their authoritative data.
 - Hashing and stored JSON go through `wok_event::json`, not stock `serde_json`.
   Event identity (id, signature, tags, content, stored payload) must survive
   migration unchanged.
 - Safe crates are `#![forbid(unsafe_code)]`. FFI is confined to the documented
-  LMDB and OS boundaries.
+  native storage and OS boundaries.
 - Advertise a NIP in NIP-11 only when the relay implements observable behavior
   for it and has conformance tests for it.
 

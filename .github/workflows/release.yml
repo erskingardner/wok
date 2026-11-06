@@ -14,14 +14,22 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate release contract and LMDB tests
+    name: Validate release contract, RocksDB storage and import recovery
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target/release-gate
+      RUST_TEST_THREADS: '2'
     outputs:
       version: ${{ steps.contract.outputs.version }}
+      prerelease: ${{ steps.contract.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,36 +43,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-  validate-rocksdb:
-    name: Validate optimized RocksDB storage, migration and recovery
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_TARGET_DIR: target/release-gate-rocksdb
-      RUST_TEST_THREADS: '2'
-    steps:
-      - uses: actions/checkout@v6
-      - name: Native compiler and libclang
-        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Lint RocksDB feature
-        run: cargo clippy --workspace --all-targets --locked --features wok-cli/rocksdb -- -D warnings
-      - name: RocksDB workspace and author-frontier recovery gates
-        run: cargo test --workspace --locked --features wok-cli/rocksdb
-
   build:
-    name: Build ${{ matrix.target }} / ${{ matrix.backend }}
-    needs: [validate, validate-rocksdb]
+    name: Build ${{ matrix.target }}
+    needs: validate
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
-        backend: [lmdb, rocksdb]
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -77,14 +62,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_BUILD_JOBS: '2'
-      CARGO_TARGET_DIR: target/${{ matrix.backend }}
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v6
       - name: Linux RocksDB compiler and libclang
-        if: matrix.backend == 'rocksdb' && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - name: macOS RocksDB libclang
-        if: matrix.backend == 'rocksdb' && runner.os == 'macOS'
+        if: runner.os == 'macOS'
         run: |
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
@@ -92,36 +77,28 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build Wok
-        run: |
-          flags=()
-          if [ '${{ matrix.backend }}' = rocksdb ]; then flags+=(--features rocksdb); fi
-          cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli "${flags[@]}"
+        run: cargo build --locked --release --target '${{ matrix.target }}' -p wok-cli
       - name: Verify embedded version
-        run: 'target/${{ matrix.backend }}/${{ matrix.target }}/release/wok --version | grep -Fx "wok ${{ needs.validate.outputs.version }}"'
+        run: 'target/${{ matrix.target }}/release/wok --version | grep -Fx "wok ${{ needs.validate.outputs.version }}"'
       - name: Verify storage backend
-        run: |
-          expected=lmdb
-          if [ '${{ matrix.backend }}' = rocksdb ]; then expected=rocksdb-author-heads-experimental; fi
-          test "$(target/${{ matrix.backend }}/${{ matrix.target }}/release/wok storage-backend)" = "$expected"
+        run: test "$(target/${{ matrix.target }}/release/wok storage-backend)" = rocksdb-author-heads-experimental
       - name: Package release archive
         env:
           COPYFILE_DISABLE: '1'
           VERSION: ${{ needs.validate.outputs.version }}
           TARGET: ${{ matrix.target }}
-          BACKEND: ${{ matrix.backend }}
         run: |
           set -euo pipefail
-          archive="wok-${VERSION}-${BACKEND}-${TARGET}"
+          archive="wok-${VERSION}-${TARGET}"
           mkdir -p "package/${archive}/docs" dist
-          install -m 0755 "target/${BACKEND}/${TARGET}/release/wok" "package/${archive}/wok"
+          install -m 0755 "target/${TARGET}/release/wok" "package/${archive}/wok"
           cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE docs/wok.toml "package/${archive}/"
           cp -R docs/. "package/${archive}/docs/"
           python3 - "$archive" <<'PY'
           import json, os, pathlib, subprocess, sys
           package = pathlib.Path('package') / sys.argv[1]
-          backend = os.environ['BACKEND']
           (package / 'BACKEND.json').write_text(json.dumps({
-              'backend': backend, 'features': ['rocksdb'] if backend == 'rocksdb' else [],
+              'backend': 'rocksdb', 'features': [],
               'storage_backend': subprocess.check_output([str(package / 'wok'), 'storage-backend'], text=True).strip(),
               'version': os.environ['VERSION'], 'target': os.environ['TARGET'],
               'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -131,7 +108,7 @@ jobs:
           tar -C package -czf "dist/${archive}.tar.gz" "$archive"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.backend }}-${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
@@ -169,10 +146,4 @@ jobs:
       - name: Publish tag release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/SHA256SUMS \
-            --verify-tag \
-            --title "Wok $VERSION" \
-            --notes-file release-notes.md
+        run: bash scripts/publish-release.sh "$GITHUB_REF_NAME" dist release-notes.md

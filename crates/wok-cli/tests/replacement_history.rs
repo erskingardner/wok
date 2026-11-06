@@ -6,35 +6,24 @@ use std::process::Command;
 fn persistent_bytes(
     database: &std::path::Path,
 ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    if cfg!(feature = "rocksdb-backend") {
-        std::fs::read_dir(database)
-            .unwrap()
-            .map(|entry| {
-                let path = entry.unwrap().path();
-                assert!(path.is_file());
-                (
-                    path.file_name().unwrap().into(),
-                    std::fs::read(&path).unwrap(),
-                )
-            })
-            .collect()
-    } else {
-        // Registered LMDB readers may update lock.mdb bookkeeping.
-        [(
-            std::path::PathBuf::from("data.mdb"),
-            std::fs::read(database.join("data.mdb")).unwrap(),
-        )]
-        .into()
-    }
+    std::fs::read_dir(database)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            assert!(path.is_file());
+            (
+                path.file_name().unwrap().into(),
+                std::fs::read(&path).unwrap(),
+            )
+        })
+        .collect()
 }
 
 #[test]
-fn doctor_and_migration_report_history_while_preserving_lossless_records() {
+fn doctor_reports_retained_replacement_history() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
-    let source_config = dir.path().join("strfry.conf");
     let local_config = dir.path().join("wok.toml");
-    let output = dir.path().join("migration");
     let events: Vec<_> = [0, 3, 30443, 1]
         .into_iter()
         .flat_map(replacement::events)
@@ -68,78 +57,6 @@ fn doctor_and_migration_report_history_while_preserving_lossless_records() {
         .unwrap()
         .iter()
         .any(|c| c["name"] == "replacement-history" && c["status"] == "warn"));
-    // The remaining assertions exercise the native strfry LMDB boundary.
-    // RocksDB has its own verified Wok-LMDB conversion suite.
-    if cfg!(feature = "rocksdb-backend") {
-        return;
-    }
-    let env = replacement::seed(&source, &events, 3);
-    let fingerprint = wok_db::event_fingerprint(&env).unwrap();
-    drop(env);
-    let source_bytes = std::fs::read(source.join("data.mdb")).unwrap();
-    std::fs::write(
-        &source_config,
-        format!(
-            "db = \"{}\"\ndbParams {{ mapsize = 67108864 }}\nrelay {{ port = 7777 }}\n",
-            source.display()
-        ),
-    )
-    .unwrap();
-    let args = [
-        "migrate",
-        "strfry",
-        "--db",
-        source.to_str().unwrap(),
-        "--config",
-        source_config.to_str().unwrap(),
-        "--output",
-        output.to_str().unwrap(),
-    ];
-    let preflight = Command::new(env!("CARGO_BIN_EXE_wok"))
-        .args(args)
-        .args(["--check", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        preflight.status.success(),
-        "{}",
-        String::from_utf8_lossy(&preflight.stderr)
-    );
-    let report: Value = serde_json::from_slice(&preflight.stdout).unwrap();
-    assert_eq!(report["source_integrity"]["superseded_events"], 6);
-    assert!(report["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s.as_str().unwrap().contains("6 superseded events")));
-    assert!(!output.exists());
-    let migrated = Command::new(env!("CARGO_BIN_EXE_wok"))
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        migrated.status.success(),
-        "{}",
-        String::from_utf8_lossy(&migrated.stderr)
-    );
-    let manifest: Value =
-        serde_json::from_slice(&std::fs::read(output.join("migration-manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(manifest["superseded_groups"], 3);
-    assert_eq!(manifest["superseded_events"], 6);
-    let target = wok_db::Env::open(
-        output.join("db"),
-        wok_db::EnvOptions {
-            map_size: 67108864,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(wok_db::event_fingerprint(&target).unwrap(), fingerprint);
-    assert_eq!(
-        std::fs::read(source.join("data.mdb")).unwrap(),
-        source_bytes
-    );
 }
 
 #[test]

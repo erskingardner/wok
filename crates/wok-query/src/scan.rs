@@ -347,13 +347,9 @@ impl ScanCursor {
 }
 
 pub struct DbScan {
-    #[cfg(all(
-        test,
-        feature = "rocksdb-author-head-reads",
-        feature = "rocksdb-read-diagnostics"
-    ))]
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_author_frontier_initialization: author_head_scan::InitializationStats,
-    #[cfg(feature = "rocksdb-author-head-reads")]
+
     author_head_reads: bool,
     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_feed_prefix: Option<bounded_feed_diagnostic::Prefix>,
@@ -988,15 +984,7 @@ impl DbScan {
                 if f.kinds.is_some() {
                     index_only = false;
                 }
-                if f.authors
-                    .as_ref()
-                    .is_some_and(|authors| authors.size() == 1)
-                    && !cfg!(feature = "rocksdb-thin-author-reads")
-                {
-                    txn.env().covering_pubkey_dbi()
-                } else {
-                    dbis.event_pubkey
-                }
+                dbis.event_pubkey
             }
             ScanPlan::Kind => dbis.event_kind,
             ScanPlan::CreatedAt => dbis.event_created_at,
@@ -1135,14 +1123,10 @@ impl DbScan {
         };
         let refill_scan_depths = vec![refill; cursors.len()];
         Self {
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_author_frontier_initialization:
                 author_head_scan::InitializationStats::default(),
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             author_head_reads: author_head_scan::eligible(f, plan, initial, cursors.len()),
             #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_feed_prefix: None,
@@ -1209,20 +1193,17 @@ impl DbScan {
         // One physical cursor per scan slice, shared by all logical author,
         // tag or kind ranges and refills. Resume endpoints remain owned by
         // ScanCursor; no native iterator survives this call or its snapshot.
-        #[cfg(feature = "rocksdb-author-head-reads")]
+
         let lazy_for_heads = depth_cap != 1 && author_head_scan::enabled(self);
-        #[cfg(not(feature = "rocksdb-author-head-reads"))]
-        let lazy_for_heads = false;
+
         let mut cursor = if self.cursors.is_empty() || lazy_for_heads {
             None
         } else {
             Some(txn.cursor(self.index_dbi)?)
         };
         if let Some(si) = self.unsettled.take() {
-            #[cfg(feature = "rocksdb-author-head-reads")]
             let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
-            #[cfg(not(feature = "rocksdb-author-head-reads"))]
-            let physical = cursor.as_mut().expect("active scan cursor");
+
             self.settle(physical, si, depth_cap)?;
         }
         loop {
@@ -1233,15 +1214,14 @@ impl DbScan {
             if self.next_init_index < self.cursors.len() {
                 // A delivery batch is fully initialized/charged before it can
                 // yield or emit. Peeks always keep the ordinary per-range path.
-                #[cfg(feature = "rocksdb-author-head-reads")]
+
                 if depth_cap != 1 && author_head_scan::initialize(self, txn, &mut cursor)? {
                     continue;
                 }
                 let idx = self.next_init_index;
-                #[cfg(feature = "rocksdb-author-head-reads")]
+
                 let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
-                #[cfg(not(feature = "rocksdb-author-head-reads"))]
-                let physical = cursor.as_mut().expect("active scan cursor");
+
                 self.approx_work += self.cursors[idx].collect(
                     physical,
                     idx as u64,
@@ -1279,10 +1259,9 @@ impl DbScan {
                 self.unsettled = Some(si);
                 return Ok(true);
             }
-            #[cfg(feature = "rocksdb-author-head-reads")]
+
             let physical = author_head_scan::physical(&mut cursor, txn, self.index_dbi)?;
-            #[cfg(not(feature = "rocksdb-author-head-reads"))]
-            let physical = cursor.as_mut().expect("active scan cursor");
+
             self.settle(physical, si, depth_cap)?;
         }
     }
@@ -1356,11 +1335,7 @@ pub struct Completeness {
 }
 
 pub struct DbQuery {
-    #[cfg(all(
-        test,
-        feature = "rocksdb-author-head-reads",
-        feature = "rocksdb-read-diagnostics"
-    ))]
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_author_frontier_initialization: author_head_scan::InitializationStats,
     pub visibility: ReadVisibility,
     pub sub: Subscription,
@@ -1379,11 +1354,7 @@ pub struct DbQuery {
     diagnostic_chronological_work: u64,
     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_feed_stats: Option<bounded_feed_diagnostic::Stats>,
-    #[cfg(all(
-        test,
-        feature = "rocksdb-author-head-reads",
-        feature = "rocksdb-read-diagnostics"
-    ))]
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     diagnostic_author_head_reads: Option<bool>,
     max_total_events: u64,
     hll: Option<HyperLogLog>,
@@ -1438,11 +1409,7 @@ impl DbQuery {
                 .iter()
                 .all(|filter| filter.search.is_some());
         Self {
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_author_frontier_initialization:
                 author_head_scan::InitializationStats::default(),
             sub,
@@ -1459,11 +1426,7 @@ impl DbQuery {
             diagnostic_chronological_work: 0,
             #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_feed_stats: None,
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             diagnostic_author_head_reads: None,
             // COUNT needs the exact deduplicated count up to its separate
             // max_filter_limit_count. The request-wide delivery ceiling is
@@ -1493,11 +1456,7 @@ impl DbQuery {
         self.completeness = !self.sub.count_only;
     }
 
-    #[cfg(all(
-        test,
-        feature = "rocksdb-author-head-reads",
-        feature = "rocksdb-read-diagnostics"
-    ))]
+    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
     fn apply_diagnostic_head_policy(&self, scan: &mut DbScan) {
         if let Some(enabled) = self.diagnostic_author_head_reads {
             scan.author_head_reads &= enabled;
@@ -1650,17 +1609,9 @@ impl DbQuery {
                 return Ok(Peek::Unknown);
             }
             let mut scanner = DbScan::new(f, snapshot.txn());
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             self.apply_diagnostic_head_policy(&mut scanner);
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             let frontier_before = scanner.diagnostic_author_frontier_initialization;
             let peek = Self::peek(
                 &mut scanner,
@@ -1676,11 +1627,7 @@ impl DbQuery {
             {
                 self.diagnostic_chronological_work += scanner.approx_work;
             }
-            #[cfg(all(
-                test,
-                feature = "rocksdb-author-head-reads",
-                feature = "rocksdb-read-diagnostics"
-            ))]
+            #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
             self.diagnostic_author_frontier_initialization.add_delta(
                 scanner.diagnostic_author_frontier_initialization,
                 frontier_before,
@@ -1844,11 +1791,7 @@ impl DbQuery {
                     } else {
                         #[allow(unused_mut)]
                         let mut scan = DbScan::new(&f, txn);
-                        #[cfg(all(
-                            test,
-                            feature = "rocksdb-author-head-reads",
-                            feature = "rocksdb-read-diagnostics"
-                        ))]
+                        #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                         self.apply_diagnostic_head_policy(&mut scan);
                         QueryScanner::Chronological(scan)
                     }
@@ -1905,11 +1848,7 @@ impl DbQuery {
                 QueryScanner::Chronological(scanner) => {
                     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     let work_before = scanner.approx_work;
-                    #[cfg(all(
-                        test,
-                        feature = "rocksdb-author-head-reads",
-                        feature = "rocksdb-read-diagnostics"
-                    ))]
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     let frontier_before = scanner.diagnostic_author_frontier_initialization;
                     let result = scanner.scan(txn, &f, &mut handle, |approx_work| {
                         if approx_work > last_work + 2000 {
@@ -1926,11 +1865,7 @@ impl DbQuery {
                             self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
                         }
                     }
-                    #[cfg(all(
-                        test,
-                        feature = "rocksdb-author-head-reads",
-                        feature = "rocksdb-read-diagnostics"
-                    ))]
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     self.diagnostic_author_frontier_initialization.add_delta(
                         scanner.diagnostic_author_frontier_initialization,
                         frontier_before,
@@ -1960,11 +1895,7 @@ impl DbQuery {
                 QueryScanner::Chronological(scanner) if cut => {
                     #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     let work_before = scanner.approx_work;
-                    #[cfg(all(
-                        test,
-                        feature = "rocksdb-author-head-reads",
-                        feature = "rocksdb-read-diagnostics"
-                    ))]
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     let frontier_before = scanner.diagnostic_author_frontier_initialization;
                     let result = Self::peek(
                         scanner,
@@ -1983,11 +1914,7 @@ impl DbQuery {
                             self.diagnostic_feed_stats = Some(scanner.diagnostic_feed_stats);
                         }
                     }
-                    #[cfg(all(
-                        test,
-                        feature = "rocksdb-author-head-reads",
-                        feature = "rocksdb-read-diagnostics"
-                    ))]
+                    #[cfg(all(test, feature = "rocksdb-read-diagnostics"))]
                     self.diagnostic_author_frontier_initialization.add_delta(
                         scanner.diagnostic_author_frontier_initialization,
                         frontier_before,
@@ -2240,6 +2167,5 @@ mod feed_query_diagnostic;
 #[path = "bounded_feed_diagnostic.rs"]
 mod bounded_feed_diagnostic;
 
-#[cfg(feature = "rocksdb-author-head-reads")]
 #[path = "author_head_scan.rs"]
 mod author_head_scan;

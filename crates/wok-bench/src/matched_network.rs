@@ -16,6 +16,15 @@ const SHAPES: [&str; 4] = ["author", "feed500", "tag", "id"];
 
 type Shared<T> = Arc<Mutex<Vec<T>>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WriterAuthors {
+    /// Preserve the original independent 32-author timed-write key domain.
+    Disjoint,
+    /// Cycle through every author named by the historical single-author plans.
+    Queried,
+}
+
 fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
@@ -64,7 +73,7 @@ fn signed(
     } else {
         anchor - 1 - (count - 1 - seq) / 100
     };
-    let kind = if seq % 10 == 0 { 7 } else { 1 };
+    let kind = if seq.is_multiple_of(10) { 7 } else { 1 };
     let bytes = 32 + (seq.wrapping_mul(7919) % 2017) as usize;
     let mut event = json!({"pubkey":pubkey,"created_at":created_at,"kind":kind,
         "tags":[["t",format!("matched-topic-{}",seq % 64)],
@@ -78,6 +87,113 @@ fn signed(
             .as_ref()
     ));
     event
+}
+
+fn writer_keys(
+    mode: WriterAuthors,
+    seed: u64,
+    filters: &[(&str, Value)],
+) -> Result<Vec<secp256k1::Keypair>> {
+    if mode == WriterAuthors::Disjoint {
+        return Ok(keys(seed, b"matched-network-timed-v1", 32));
+    }
+    let mut available: HashMap<_, _> = keys(seed, b"matched-network-corpus-v1", AUTHORS)
+        .into_iter()
+        .map(|key| (hex::encode(key.x_only_public_key().0.serialize()), key))
+        .collect();
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, filter) in filters.iter().filter(|(shape, _)| *shape == "author") {
+        let author = filter["authors"]
+            .as_array()
+            .filter(|authors| authors.len() == 1)
+            .and_then(|authors| authors[0].as_str())
+            .context("queried writer mode requires single-author historical plans")?;
+        if seen.insert(author.to_owned()) {
+            selected.push(available.remove(author).with_context(|| {
+                format!("queried writer author does not belong to --seed {seed}'s matched corpus")
+            })?);
+        }
+    }
+    ensure!(
+        selected.len() == POOL,
+        "queried writers need 64 distinct author plans"
+    );
+    for (_, filter) in filters.iter().filter(|(shape, _)| *shape == "feed500") {
+        ensure!(
+            filter["authors"].as_array().is_some_and(|authors| authors
+                .iter()
+                .any(|author| author.as_str().is_some_and(|author| seen.contains(author)))),
+            "queried writers must overlap every feed500 plan"
+        );
+    }
+    Ok(selected)
+}
+
+fn annotate_writer_workload(
+    report: &mut Value,
+    args: &Args,
+    filters: &[(&str, Value)],
+    keyring: &[secp256k1::Keypair],
+    events: &[Value],
+) -> Result<()> {
+    // Default reports and all existing input hashes keep their original bytes.
+    if args.matched_writer_authors == WriterAuthors::Disjoint {
+        return Ok(());
+    }
+    let authors: std::collections::BTreeSet<_> = keyring
+        .iter()
+        .map(|key| hex::encode(key.x_only_public_key().0.serialize()))
+        .collect();
+    let author_set_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&authors)?));
+    let mut overlaps = serde_json::Map::new();
+    for shape in SHAPES {
+        let plans: Vec<_> = filters.iter().filter(|(name, _)| *name == shape).collect();
+        let counts: Vec<_> = plans
+            .iter()
+            .filter_map(|(_, filter)| filter["authors"].as_array())
+            .map(|selected| {
+                selected
+                    .iter()
+                    .filter(|author| {
+                        author
+                            .as_str()
+                            .is_some_and(|author| authors.contains(author))
+                    })
+                    .count()
+            })
+            .collect();
+        overlaps.insert(shape.into(), json!({
+            "plans":plans.len(),"author_filter_plans":counts.len(),
+            "plans_with_writer_authors":counts.iter().filter(|&&count|count>0).count(),
+            "minimum_writer_authors":counts.iter().min(),"maximum_writer_authors":counts.iter().max()
+        }));
+    }
+    let mut event_ids = Sha256::new();
+    for event in events {
+        event_ids.update(
+            event["id"]
+                .as_str()
+                .context("generated write has no ID")?
+                .as_bytes(),
+        );
+    }
+    let writer = json!({"mode":args.matched_writer_authors,"author_count":authors.len(),
+        "pubkey_set_sha256":author_set_sha256,"query_shape_overlap":overlaps,
+        "overlap_scope":"public author-key intersection, ignoring until; tag/id plans have no author restriction",
+        "timed_event_ids_sha256":hex::encode(event_ids.finalize())});
+    let mut workload = json!({"format":"network-matched-queried-authors-v1",
+        "matched_writer_authors":args.matched_writer_authors,
+        "corpus_sha256":report["corpus_sha256"],"query_plan_sha256":report["query_plan_sha256"],
+        "history_cutoff":report["history_cutoff"],"seed":args.seed,
+        "offered_writes":events.len(),"write_rate":args.send_rate,"read_rate":args.read_rate,
+        "read_connections":args.read_connections,"publish_connections":args.publish_connections,
+        "drain_secs":args.drain_secs,"writer_authors":writer});
+    workload.sort_all_objects();
+    report["matched_writer_authors"] = json!(args.matched_writer_authors);
+    report["workload_sha256"] = json!(hex::encode(Sha256::digest(serde_json::to_vec(&workload)?)));
+    report["workload"] = workload;
+    Ok(())
 }
 fn generate(args: &Args) -> Result<()> {
     let n = args
@@ -668,6 +784,10 @@ async fn run(args: &Args, corpus: &corpus::Corpus, path: &Path) -> Result<()> {
             && args.publish_connections > 0,
         "positive rates/counts required"
     );
+    ensure!(
+        args.matched_writer_authors == WriterAuthors::Disjoint || n >= POOL as u64,
+        "queried writer mode requires at least 64 writes to exercise every selected author"
+    );
     let (cutoff, filters) = corpus.matched_filters(POOL)?;
     ensure!(
         cutoff < unix_timestamp()?,
@@ -685,7 +805,7 @@ async fn run(args: &Args, corpus: &corpus::Corpus, path: &Path) -> Result<()> {
             .collect(),
     );
     let plan_hash = hex::encode(Sha256::digest(serde_json::to_vec(&filters)?));
-    let keyring = keys(args.seed, b"matched-network-timed-v1", 32);
+    let keyring = writer_keys(args.matched_writer_authors, args.seed, &filters)?;
     let events = Arc::new(
         (0..n)
             .map(|seq| signed(seq, n, cutoff + 1, args.seed, &keyring, true))
@@ -881,6 +1001,7 @@ async fn run(args: &Args, corpus: &corpus::Corpus, path: &Path) -> Result<()> {
         .as_object_mut()
         .unwrap()
         .extend(validation.as_object().unwrap().clone());
+    annotate_writer_workload(&mut report, args, &filters, &keyring, &events)?;
     std::fs::write(
         args.out.join("network-matched.json"),
         serde_json::to_vec_pretty(&report)?,
@@ -908,11 +1029,12 @@ pub(super) fn dispatch(args: &Args) -> Result<()> {
     if let Err(error) = &result {
         let report = args.out.join("network-matched.json");
         if !report.exists() {
-            std::fs::write(
-                report,
-                serde_json::to_vec_pretty(&json!({"format":"network-matched-v1","ok":false,
-                "stage":"preflight_or_setup","target_url":args.target_url,"error":format!("{error:#}")}))?,
-            )?;
+            let mut failure = json!({"format":"network-matched-v1","ok":false,
+                "stage":"preflight_or_setup","target_url":args.target_url,"error":format!("{error:#}")});
+            if args.matched_writer_authors == WriterAuthors::Queried {
+                failure["matched_writer_authors"] = json!(args.matched_writer_authors);
+            }
+            std::fs::write(report, serde_json::to_vec_pretty(&failure)?)?;
         }
     }
     result
@@ -921,6 +1043,186 @@ pub(super) fn dispatch(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matched_corpus(seed: u64) -> (TempDir, Vec<Value>, corpus::Corpus) {
+        let directory = tempfile::tempdir().unwrap();
+        let keyring = keys(seed, b"matched-network-corpus-v1", AUTHORS);
+        let values: Vec<_> = (0..AUTHORS as u64)
+            .map(|seq| signed(seq, AUTHORS as u64, 10_000, seed, &keyring, false))
+            .collect();
+        let path = directory.path().join("corpus.jsonl");
+        write_jsonl(&path, &values).unwrap();
+        let corpus = corpus::Corpus::load(&path).unwrap();
+        (directory, values, corpus)
+    }
+
+    fn overlap_args() -> Args {
+        Args::try_parse_from([
+            "wok-bench",
+            "--scenario",
+            "matched_network",
+            "--seed",
+            "257",
+            "--matched-writer-authors",
+            "queried",
+        ])
+        .unwrap()
+    }
+
+    fn identity_report(cutoff: u64, filters: &[(&str, Value)]) -> Value {
+        json!({"corpus_sha256":"fixture-corpus", "history_cutoff":cutoff,
+            "query_plan_sha256":hex::encode(Sha256::digest(serde_json::to_vec(filters).unwrap()))})
+    }
+
+    #[test]
+    fn queried_writers_cover_every_author_and_feed_plan() {
+        let (_, _, corpus) = matched_corpus(257);
+        let (cutoff, filters) = corpus.matched_filters(POOL).unwrap();
+        let selected = writer_keys(WriterAuthors::Queried, 257, &filters).unwrap();
+        assert_eq!(selected.len(), 64);
+        let mut report = identity_report(cutoff, &filters);
+        let events: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, cutoff + 1, 257, &selected, true))
+            .collect();
+        annotate_writer_workload(&mut report, &overlap_args(), &filters, &selected, &events)
+            .unwrap();
+        let writer = &report["workload"]["writer_authors"];
+        assert_eq!(writer["author_count"], 64);
+        for shape in ["author", "feed500"] {
+            let overlap = &writer["query_shape_overlap"][shape];
+            assert_eq!(overlap["plans"], 64);
+            assert_eq!(overlap["plans_with_writer_authors"], 64);
+            assert!(overlap["minimum_writer_authors"].as_u64().unwrap() > 0);
+        }
+        for shape in ["tag", "id"] {
+            assert_eq!(
+                writer["query_shape_overlap"][shape]["author_filter_plans"],
+                0
+            );
+            assert!(writer["query_shape_overlap"][shape]["minimum_writer_authors"].is_null());
+        }
+        assert!(writer.get("pubkeys").is_none());
+    }
+
+    #[test]
+    fn overlapping_appends_do_not_change_fixed_cutoff_order_or_body_oracle() {
+        let (_, history, corpus) = matched_corpus(257);
+        let (cutoff, filters) = corpus.matched_filters(POOL).unwrap();
+        let selected = writer_keys(WriterAuthors::Queried, 257, &filters).unwrap();
+        let appends: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, cutoff + 1, 257, &selected, true))
+            .collect();
+        assert!(appends
+            .iter()
+            .all(|event| event["created_at"] == cutoff + 1));
+        let mut combined = history.clone();
+        combined.extend(appends.iter().cloned());
+        for (_, filter) in &filters {
+            let expected = expected_history(&history, filter);
+            assert_eq!(expected_history(&combined, filter), expected);
+            assert!(history_matches(&corpus.expected(filter).owned(), &expected));
+            assert!(appends.iter().all(|event| !matches_filter(event, filter)));
+        }
+        let mut widened = filters[0].1.clone();
+        widened["until"] = json!(cutoff + 1);
+        assert!(expected_history(&combined, &widened)
+            .iter()
+            .any(|event| event["id"] == appends[0]["id"]));
+        let mut corrupted = expected_history(&history, &filters[0].1);
+        corrupted[0]["content"] = json!("changed stored body");
+        assert!(!history_matches(
+            &corpus.expected(&filters[0].1).owned(),
+            &corrupted
+        ));
+    }
+
+    #[test]
+    fn queried_writer_mode_rejects_unexercised_authors_before_output_or_connections() {
+        let (directory, _, corpus) = matched_corpus(257);
+        let mut args = overlap_args();
+        args.events = Some(63);
+        args.target_url = Some("ws://127.0.0.1:1".into());
+        args.out = directory.path().join("must-not-be-created");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(run(&args, &corpus, &args.out.join("network-matched.json")))
+            .unwrap_err();
+        assert!(error.to_string().contains("at least 64 writes"));
+        assert!(!args.out.exists());
+    }
+
+    #[test]
+    fn queried_writer_mode_rejects_a_mismatched_corpus_seed() {
+        let (_, _, corpus) = matched_corpus(257);
+        let (_, filters) = corpus.matched_filters(POOL).unwrap();
+        assert!(writer_keys(WriterAuthors::Queried, 258, &filters)
+            .unwrap_err()
+            .to_string()
+            .contains("does not belong"));
+    }
+
+    #[test]
+    fn default_writers_preserve_legacy_jsonl_and_report_bytes() {
+        let args = Args::try_parse_from(["wok-bench"]).unwrap();
+        assert_eq!(args.matched_writer_authors, WriterAuthors::Disjoint);
+        let legacy = keys(257, b"matched-network-timed-v1", 32);
+        let selected = writer_keys(WriterAuthors::Disjoint, 257, &[]).unwrap();
+        assert_eq!(selected.len(), 32);
+        let original: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, 10_000, 257, &legacy, true))
+            .collect();
+        let current: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, 10_000, 257, &selected, true))
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let before = directory.path().join("before.jsonl");
+        let after = directory.path().join("after.jsonl");
+        write_jsonl(&before, &original).unwrap();
+        write_jsonl(&after, &current).unwrap();
+        assert_eq!(
+            std::fs::read(&before).unwrap(),
+            std::fs::read(&after).unwrap()
+        );
+        assert_eq!(sha256_file(&before).unwrap(), sha256_file(&after).unwrap());
+        let mut report = json!({"format":"network-matched-v1","ok":true});
+        let bytes = serde_json::to_vec_pretty(&report).unwrap();
+        annotate_writer_workload(&mut report, &args, &[], &selected, &current).unwrap();
+        assert_eq!(serde_json::to_vec_pretty(&report).unwrap(), bytes);
+    }
+
+    #[test]
+    fn queried_writer_ids_and_workload_hash_are_deterministic_and_bind_rates() {
+        let (_, _, corpus) = matched_corpus(257);
+        let (cutoff, filters) = corpus.matched_filters(POOL).unwrap();
+        let selected = writer_keys(WriterAuthors::Queried, 257, &filters).unwrap();
+        let again = writer_keys(WriterAuthors::Queried, 257, &filters).unwrap();
+        let events: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, cutoff + 1, 257, &selected, true))
+            .collect();
+        let repeated: Vec<_> = (0..128)
+            .map(|seq| signed(seq, 128, cutoff + 1, 257, &again, true))
+            .collect();
+        assert_eq!(events, repeated);
+        let mut args = overlap_args();
+        let mut first = identity_report(cutoff, &filters);
+        let mut second = first.clone();
+        annotate_writer_workload(&mut first, &args, &filters, &selected, &events).unwrap();
+        annotate_writer_workload(&mut second, &args, &filters, &again, &repeated).unwrap();
+        assert_eq!(first, second);
+        // The offline controller guard consumes these exact Rust-rendered bytes.
+        println!("WOK_MATCHED_WRITER_WORKLOAD_FIXTURE={first}");
+        args.send_rate = 4_000.0;
+        let mut changed = identity_report(cutoff, &filters);
+        annotate_writer_workload(&mut changed, &args, &filters, &selected, &events).unwrap();
+        assert_ne!(first["workload_sha256"], changed["workload_sha256"]);
+        assert_eq!(
+            first["workload"]["writer_authors"],
+            changed["workload"]["writer_authors"]
+        );
+    }
     #[test]
     fn matched_preflight_waits_for_count_past_old_timeout() {
         let rt = tokio::runtime::Builder::new_current_thread()

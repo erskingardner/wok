@@ -28,9 +28,16 @@ jobs:
   dependencies:
     name: advisories, licenses, and sources
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: RocksDB native compiler and libclang
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          command: check advisories bans licenses sources
-          arguments: --all-features
+          tool: cargo-deny
+      - name: Check runtime and diagnostic dependency graphs
+        run: cargo deny --locked --all-features check advisories bans licenses sources

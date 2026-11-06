@@ -1,11 +1,11 @@
-//! RocksDB environment for the opt-in experimental relay binary.
+//! The RocksDB runtime environment. LMDB is confined to offline migration.
 #![forbid(unsafe_code)]
 use crate::fbs::{decode_meta, encode_meta, encode_negentropy_filter, Meta};
 use crate::rocks::*;
 use crate::txn::{RoTxn, RwTxn};
 use crate::DbError;
 use lmdb_sys::*;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug)]
@@ -35,44 +35,13 @@ impl Default for EnvOptions {
 }
 
 impl EnvOptions {
-    /// Defaults with a 1 GiB map for tests and fixtures.
-    ///
-    /// Each open env reserves `map_size` of virtual address space, so many
-    /// concurrently running tests at the 10 TiB production default exhaust it
-    /// and fail with `ENOMEM`. Not for production databases.
+    /// Test defaults; legacy LMDB tuning fields are accepted but ignored.
     pub fn for_tests() -> Self {
         Self {
             map_size: 1 << 30,
             ..Self::default()
         }
     }
-}
-
-/// Permission bits for the database files Wok creates: LMDB's `data.mdb` and
-/// `lock.mdb`, and compact copies. Stored events include gift wraps and other
-/// recipient-only kinds, so users outside the file's group get no access; the
-/// group keeps read, and the umask can only remove more. A file that already
-/// exists keeps its mode.
-pub(crate) const DB_FILE_MODE: u32 = 0o640;
-
-/// Create a new file for a compact copy with [`DB_FILE_MODE`]. LMDB's
-/// `mdb_env_copy2` would create it with mode `0666`.
-pub(crate) fn create_copy_file(path: &Path) -> Result<std::fs::File, DbError> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(DB_FILE_MODE)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                DbError::msg(format!(
-                    "output file '{}' exists, not overwriting",
-                    path.display()
-                ))
-            } else {
-                DbError::msg(format!("create '{}': {e}", path.display()))
-            }
-        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,9 +101,6 @@ pub struct EnvInner {
 #[derive(Clone)]
 pub struct Env {
     pub inner: Arc<EnvInner>,
-}
-pub fn lmdb_version() -> (i32, i32, i32) {
-    (0, 9, 37)
 }
 
 /// Numeric/table options shared by ordinary opens and the private offline tests.
@@ -240,7 +206,7 @@ impl Env {
         }
         if path.join("data.mdb").exists() || path.join("lock.mdb").exists() {
             return Err(err(
-                "refusing LMDB directory; RocksDB requires a separate new database",
+                "LMDB database requires offline migration: stop the relay, run `wok migrate rocksdb --source <old-directory> --output <new-directory> --confirm-relay-stopped`, then configure the new directory",
             ));
         }
         if !path.exists() && opts.create_dir {
@@ -262,6 +228,19 @@ impl Env {
             // open can perform recovery or mutate auxiliary files. As with all
             // maintenance, the directory must not be replaced during open.
             check_existing_layout(path)?;
+        }
+        if !opts.read_only {
+            // RocksDB inherits native file modes. Protect the complete database
+            // directory, including journals and future compaction outputs,
+            // without a process-global umask or chmod on checkpoint hard links.
+            let permissions = std::fs::metadata(path).map_err(err)?.permissions();
+            if permissions.mode() & 0o007 != 0 {
+                std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(permissions.mode() & !0o007),
+                )
+                .map_err(err)?;
+            }
         }
         let (mut options, cfs) = native_options(fresh, physical_cf_names());
         if opts.read_only {
@@ -366,11 +345,7 @@ impl Env {
         RwTxn::begin(self)
     }
     pub fn covering_pubkey_dbi(&self) -> MDB_dbi {
-        if cfg!(feature = "rocksdb-coverless") {
-            self.dbis().event_pubkey
-        } else {
-            COVER_DBI
-        }
+        self.dbis().event_pubkey
     }
     pub fn check_background_errors(&self) -> Result<(), DbError> {
         for name in physical_cf_names() {
@@ -447,16 +422,6 @@ impl Env {
         })
     }
 
-    pub fn compact_to_fd(&self, _fd: i32) -> Result<(), DbError> {
-        Err(err(
-            "RocksDB checkpoints are directories; stream compaction is unsupported",
-        ))
-    }
-    pub fn compact_to_path(&self, _path: &Path) -> Result<(), DbError> {
-        Err(err(
-            "use a closed RocksDB directory copy; LMDB compact-file output is unsupported",
-        ))
-    }
     #[cfg(feature = "op-log")]
     pub fn set_no_meta_sync(&self, _on: bool) -> Result<(), DbError> {
         Err(err("LMDB durability flag is unavailable on RocksDB"))

@@ -1,6 +1,6 @@
 # wok-cli
 
-The `wok` binary. Subcommands cover relay, verified strfry migration, DB utilities, diagnostics, and mesh tooling.
+The `wok` binary. Subcommands cover relay, direct read-only LMDB migration to RocksDB, DB utilities, diagnostics, and mesh tooling.
 
 Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default config path: `wok.toml`.
 
@@ -25,8 +25,8 @@ Build: `cargo build --release -p wok-cli` → `target/release/wok`. Default conf
 | Migration | `migrate strfry`, `migrate rocksdb` (`--check` preflight) |
 | Relay | `relay` |
 | Diagnostics | `doctor`, `integrity`, `info`, `storage-backend`, `config show` |
-| Maintenance | `backup`, `reindex`, `purge-superseded`, `compact`, `dict`, `negentropy`, `config minimize` |
+| Maintenance | `backup`, `reindex`, `purge-superseded`, `dict`, `negentropy`, `config minimize` |
 | Data | `import`, `export`, `scan`, `event`, `delete`, `monitor` |
 | Mesh | `router`, `sync`, `upload`, `download` |
 
-`migrate` never mutates the source strfry DB/config. `reindex` requires `--confirm-relay-stopped`. Broken-pipe on stdout is a clean exit (not abort under `panic = "abort"`).
+`migrate` preserves authoritative source LMDB data/config; registered reader coordination may update lock.mdb. Runtime is RocksDB only. Stop the relay before backup or mutating utilities. `reindex` requires `--confirm-relay-stopped`. Broken-pipe on stdout is a clean exit (not abort under `panic = "abort"`).

@@ -184,23 +184,31 @@ tags. Each rate was repeated with reversed relay order: ten minutes at 1,000
 writes/second and five at 4,000. Checks verified bodies, ordering, completion
 and readback of every accepted write.
 
-| Measurement | Wok RocksDB | strfry |
-| --- | ---: | ---: |
-| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms |
-| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms |
-| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms |
-| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms |
+Four later **fastr** runs covered the same workload and 16 query cases. fastr
+used buffered write acknowledgments without an fsync barrier; its write latency
+has a different durability guarantee.
+
+| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) |
+| --- | ---: | ---: | ---: |
+| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s |
+| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s |
+| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s |
+| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms |
 
 Latency runs from scheduled arrival to EOSE/acknowledgement, including client
 and network delay. Ranges span individual trial percentiles without pooling.
-Wok reduced read p99 by **34–61% in all 16 matched cases**, with a worse rare
-read tail in one run. Finite, prewarmed runs do not establish maximum capacity
+fastr accumulated queues under sustained mixed traffic; its seconds-long values
+include waiting before send. Wok reduced read p99 versus strfry by **34–61% in
+all 16 matched cases**, with a worse rare read tail in one run. Finite,
+prewarmed runs do not establish maximum capacity
 or equal power-loss durability. Writers used different authors from the queries.
 A separate ten-minute correctness run covered writes to queried authors, live
 delivery, restart and forced-crash recovery.
 
 Results describe the measured RocksDB candidate at
-[`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8),
+[`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8)
+and fastr at
+[`bdbc0bc`](https://github.com/arx-ccn/fastr/commit/bdbc0bc053ad66df444eb47a02aa468e0109775d),
 before the single-runtime release preparation; they do not measure every later
 release change. [Evidence and limits](https://github.com/erskingardner/wok/pull/294)
 · [Matched campaign instructions](https://github.com/erskingardner/wok/tree/master/tools/relay-matched).

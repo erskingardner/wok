@@ -47,7 +47,7 @@ pub(super) fn run_writer(
     // Bytes of committed events the req monitors still hold.
     let stored_in_flight = Arc::new(AtomicUsize::new(0));
     let mut tag_kind = TagKindBackfill::new(tag_kind_step);
-    tag_kind.recheck(&env, &metrics);
+    tag_kind.recheck(&env, &metrics, cfg.read().relay.tag_kind_index_enabled);
     let mut search = SearchBuild::new();
     search.recheck(&env, &metrics, cfg.read().relay.search_enabled);
     let mut storage_writes = ThreadStorageWrites::open();
@@ -131,9 +131,10 @@ pub(super) fn run_writer(
         let cfg_snap = cfg.read().clone();
         plugin.set_timeout(cfg_snap.relay.write_policy_timeout_secs);
         search.set_enabled(cfg_snap.relay.search_enabled);
+        tag_kind.set_enabled(cfg_snap.relay.tag_kind_index_enabled);
         if maintenance_requested {
             run_maintenance(&env, &cfg_snap, &mut maintenance_cursor);
-            tag_kind.recheck(&env, &metrics);
+            tag_kind.recheck(&env, &metrics, cfg_snap.relay.tag_kind_index_enabled);
             search.recheck(&env, &metrics, cfg_snap.relay.search_enabled);
         }
         let vanish_policy = cfg_snap.vanish_policy();
@@ -232,7 +233,11 @@ pub(super) fn run_writer(
                                 )
                             } else {
                                 (
-                                    is_event_vanished_ro(&txn, packed_view)?,
+                                    wok_db::is_event_vanished_ro_with_json(
+                                        &txn,
+                                        packed_view,
+                                        &json,
+                                    )?,
                                     moderation_reason_ro(&txn, packed_view)?,
                                     grant.stored_admits(&txn, &cfg_snap, packed_view.kind())?,
                                 )
@@ -244,7 +249,11 @@ pub(super) fn run_writer(
                             // first is a setting.
                             Ok((vanished, moderated, write_allowed)) => (
                                 vanished
-                                    || event_matches_vanish_markers(packed_view, &batch_vanish),
+                                    || event_matches_vanish_markers(
+                                        packed_view,
+                                        &batch_vanish,
+                                        &json,
+                                    ),
                                 moderated.map(|reason| (reason, None)).or((!cfg_snap
                                     .accepts_kind(packed_view.kind()))
                                 .then_some((
@@ -508,6 +517,9 @@ pub(super) fn run_writer(
         // `None` when the global quota refuses the batch.
         let mut write_batch = |events: &mut Vec<EventToWrite<u64>>| {
             let mut txn = env.begin_rw()?;
+            if !cfg_snap.relay.tag_kind_index_enabled {
+                wok_db::skip_tag_kind_postings(&mut txn);
+            }
             let mut tree_batch = negentropy_cache.batch();
             wok_db::write::write_events_with_quota(
                 &mut txn,
@@ -728,9 +740,10 @@ impl ThreadStorageWrites {
 /// Builds `wok_Event__tagKind` in the background, one bounded write
 /// transaction at a time: by a key-ordered pass for a database from before
 /// the index, and in local-id order for the events an earlier release
-/// inserted.
+/// inserted. Nothing is built while `relay.tag_kind_index_enabled` is off.
 pub(super) struct TagKindBackfill {
     step: TagKindStep,
+    enabled: bool,
     pending: bool,
     paused_for_disk: bool,
     run: Option<TagKindBackfillRun>,
@@ -747,21 +760,28 @@ impl TagKindBackfill {
     pub(super) fn new(step: TagKindStep) -> Self {
         Self {
             step,
+            enabled: false,
             pending: false,
             paused_for_disk: false,
             run: None,
         }
     }
 
+    /// Whether a step would index anything.
     pub(super) fn pending(&self) -> bool {
-        self.pending
+        self.enabled && self.pending
+    }
+
+    pub(super) fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     /// Read where the index stands and start a backfill if it is behind.
     /// The writer does this at start and on every maintenance tick: another
     /// process, such as an earlier release's `wok import`, may have stored
     /// events without entries.
-    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics) {
+    pub(super) fn recheck(&mut self, env: &Env, metrics: &Metrics, enabled: bool) {
+        self.enabled = enabled;
         let state = env.begin_ro().and_then(|txn| {
             let tag_entries = txn.entries(txn.env().dbis().event_tag)? as u64;
             Ok(wok_db::tag_kind_index_state_ro(&txn)?.map(|state| (state, tag_entries)))
@@ -1208,6 +1228,7 @@ pub(super) fn apply_management(
 pub(super) fn event_matches_vanish_markers(
     packed: PackedEventView<'_>,
     markers: &HashMap<[u8; 32], u64>,
+    json: &str,
 ) -> bool {
     if packed.kind() != VANISH_KIND {
         let mut author = [0u8; 32];
@@ -1215,6 +1236,7 @@ pub(super) fn event_matches_vanish_markers(
         if markers
             .get(&author)
             .is_some_and(|timestamp| packed.created_at() <= *timestamp)
+            && !wok_db::is_deletion_protected_json(packed, json).unwrap_or(false)
         {
             return true;
         }
@@ -2179,6 +2201,80 @@ mod tests {
                 .load(Ordering::Relaxed),
             100
         );
+    }
+
+    #[test]
+    fn with_the_tag_kind_index_off_the_writer_neither_posts_nor_builds() {
+        let (dir, env) = unindexed_database(50);
+        let mut config = Config {
+            db: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.relay.tag_kind_index_enabled = false;
+        // The gift wraps are stored only while someone could read them.
+        config.relay.auth.service_url = "wss://relay.example.com".into();
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let metrics = Arc::new(Metrics::default());
+        let (writer_tx, writer_rx) = bounded(4);
+        let writer = {
+            let (env, config, metrics, moderation) = (
+                env.clone(),
+                config.clone(),
+                metrics.clone(),
+                moderation(&env),
+            );
+            std::thread::spawn(move || {
+                run_writer(
+                    env,
+                    config,
+                    Arc::new(ConnTable::new()),
+                    metrics,
+                    writer_rx,
+                    Vec::new(),
+                    moderation,
+                    TEN_ENTRIES,
+                )
+            })
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The writer takes its messages in order, so once the second
+        // publication is stored, the maintenance tick before it has run.
+        writer_tx.send(add_event(50)).unwrap();
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        writer_tx.send(add_event(51)).unwrap();
+        wait_for("publications not stored", &|| {
+            metrics.written_events_total.load(Ordering::Relaxed) == 2
+        });
+        let off = tag_kind_state(&env);
+        assert_eq!((off.indexed_through, off.high_water), (0, 52));
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        assert_eq!(report.tag_kind_index.unwrap().actual_entries, 0);
+        assert_eq!(
+            metrics
+                .tag_kind_backfill_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Back on, the next maintenance tick starts the build, which covers
+        // the publications too.
+        config.write().relay.tag_kind_index_enabled = true;
+        writer_tx.send(WriterMsg::Maintenance).unwrap();
+        wait_for("backfill stalled", &|| {
+            metrics.tag_kind_index_complete.load(Ordering::Relaxed) == 1
+        });
+        writer_tx.send(WriterMsg::Stop).unwrap();
+        writer.join().unwrap();
+        let report = wok_db::check_integrity(&env.begin_ro().unwrap()).unwrap();
+        let tag_kind = report.tag_kind_index.unwrap();
+        assert!(tag_kind.complete && tag_kind.missing_entries == 0);
+        assert_eq!(tag_kind.actual_entries, 52);
     }
 
     /// An unsigned note saying "hello world".

@@ -15,6 +15,9 @@ pub const DEFAULT_MAX_EVENT_SIZE: usize = 1024 * 1024;
 /// and kind-10000/30000 lists of heavy users.
 pub const DEFAULT_MAX_NUM_TAGS: usize = 5_000;
 
+/// Smallest explicit expiration timestamp accepted by PackedEvent parsing.
+pub(crate) const MIN_REPRESENTABLE_EXPIRATION: u64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct EventLimits {
     pub max_event_size: usize,
@@ -274,7 +277,7 @@ pub(crate) fn pack_event(
             )?;
         } else if tag_name == "expiration" && expiration == 0 {
             expiration = parse_uint64(tag_val)?;
-            if expiration < 100 {
+            if expiration < MIN_REPRESENTABLE_EXPIRATION {
                 return Err(EventError::msg("invalid expiration"));
             }
         }

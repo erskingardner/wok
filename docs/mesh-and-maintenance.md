@@ -56,7 +56,9 @@ allocated), `complete`, `bulk_pass` (the `target` and `visited` entries of a
 key-ordered build in progress), `tag_entries` (the `Event__tag` entries such a
 build visits), and its expected, actual, missing, unexpected and stale
 entries. Doctor's `tag-kind-index` check passes when the index is complete
-and every entry matches its event. It warns while the index is incomplete,
+and every entry matches its event, and when `relay.tag_kind_index_enabled`
+is off and the index is incomplete or absent. With the index on, it warns
+while the index is incomplete,
 with the build's progress: a database from before the index, which the relay
 builds in key order on its first start, an import stopped before it built the
 index, which the relay finishes the same way, or events an earlier Wok release

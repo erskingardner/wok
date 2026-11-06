@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
+  events signed with `["no_delete"]` survive their author's kind-5 deletion
+  and kind-62 purge requests, regardless of arrival order or republication.
+  Recipient gift-wrap deletion, expiration and operator policy still apply.
+  Invalid markers and expiration metadata are refused, and replaceable,
+  addressable and ephemeral kinds cannot opt in. NIP-11 keeps its standard
+  `supported_nips` integer-only and advertises `"D9"` in the provisional
+  `wok.supported_nips` extension; the landing page links to the draft.
+- Outbound sync/router discovery ignores unknown standard-array entries
+  without converting strings such as `"5A"` or `"91"` into numeric NIPs.
+  Routing ignores the provisional `wok` extension.
+- Reads reuse a completed NIP-62 author sweep's verification of protected
+  survivors, avoiding repeated payload hashing and signature verification
+  when a query exceeds the bounded protection cache. Raised cutoffs and
+  reindex require verification again. Unreadable payloads are retained with
+  a warning, allowing expiry and vanish maintenance to continue while an
+  incomplete-verification flag prevents granting them protection by shortcut.
+- AUTH uses the same D9 validation prefixes as EVENT: an ineligible kind
+  carrying `no_delete` receives `restricted:`.
+
 ### Security
 
 - Update zstd to 0.14.3 (zstd-safe 8.2.0, zstd-sys 2.1.2) for
@@ -752,6 +774,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds a `tag-kind-index` check: those leftover entries and a build in
   progress are warnings, and entries missing below the index's progress
   marker are a failure.
+- `relay.tag_kind_index_enabled` (default `true`, live, on the dashboard)
+  turns the `(tag, kind, created_at)` index off. Off, the writer and
+  `wok import` put no entries for the events they store and build none, and
+  tag filters with `kinds` read the tag index, as while the index is
+  incomplete. Publishing then writes 11–16% fewer bytes per event on a
+  typical mix and 18–32% fewer on a follow-list-heavy one, measured with
+  `db_write`. Turned back on, the writer builds the missing entries in the
+  background. `wok doctor` reports the index as off rather than incomplete.
 - `relay.max_filter_bytes_per_connection` (default 2097152, 2 MiB) bounds the
   filter bytes of the REQ subscriptions open on one connection. Live filters
   stay in memory until closed, so without it a larger

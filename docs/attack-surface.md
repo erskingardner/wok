@@ -48,6 +48,34 @@ does. The relay at startup, and `wok doctor` in its `unix-access` check,
 warn when the socket's mode lets every local user connect and
 `auth_uids` and `auth_gids` are both empty.
 
+## Deletion protection cost
+
+NIP-D9 survivors under an author-vanish cutoff require signed-payload
+verification until that author's bounded sweep pass finishes, and again after
+reindex or a raised cutoff. These reads hash the stored primary bytes and, on
+a miss in the 4096-entry cache, decompress, parse and verify the event's
+signature. Queries exceeding that cache can repeat this cost while cleanup is
+pending; query-work limits bound the number of events, not their cryptographic
+cost. After the author pass finishes, reads use its persisted progress and
+matching stored PackedEvent in the same snapshot instead, without touching
+the payload. Recipient-vanish checks still apply independently. If a sweep
+retains an unreadable record, its persisted incomplete-verification flag
+prevents this shortcut; healthy records for that author continue to use the
+verified-payload path until repair and reindex.
+
+A kind-5 request also checks each same-author `e` target's payload on the
+single writer, inside its write transaction. Targets with `no_delete` can
+require decompression, parsing, repacking and Schnorr verification. The
+`events.max_num_tags` ceiling (5000 by default) and event-size limit bound
+the target list, but there is no separate verification-work budget or deferred
+queue. A list larger than the 4096-entry cache can repeatedly evict entries;
+protected targets remain stored, so fresh signed requests can repeat that
+work and delay other writes. EVENT address/author rate limits pace requests,
+not their number of target verifications. Operators can lower
+`events.max_num_tags` and publication budgets to reduce this exposure, at the
+cost of refusing large follow/mute lists and high-volume legitimate clients.
+See [NIP support](nips.md) and [configuration](config.md).
+
 ## Network listener
 
 Every request on the listener passes these steps before Wok looks at its path:
@@ -316,7 +344,13 @@ queued their teardown before it stops the relay, so a connection's teardown
 is counted in the phase that opened it. The probe shares its process with
 the relay, so it signs events, frames Unix messages and builds its NIP-77
 message without the relay's crates: every function counted is one the relay
-ran.
+ran. Its relays run without the maintenance timer, which every two seconds
+has the writer delete expired events and sweep the events of authors who
+vanished (NIP-62). No caller sends that tick, and whether the first one lands
+inside a phase depends on how long the phase takes on the runner, so the
+admin phase, with its wait of a second, would count it on a slow run and not
+on a fast one. Code that maintenance shares with a request is still counted
+in the phase whose request runs it.
 
 From each run it keeps the functions of the relay crates (`wok-relay`,
 `wok-ws`, `wok-unix`, `wok-event`, `wok-query`, `wok-negentropy` and

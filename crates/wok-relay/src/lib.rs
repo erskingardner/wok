@@ -16,7 +16,7 @@ pub mod source;
 
 pub use abuse::ConnectionSlot;
 pub use capabilities::{
-    relay_capabilities, supported_nips, CapabilityCondition, RelayCapability,
+    relay_capabilities, supported_nips, CapabilityCondition, NipId, RelayCapability,
     RELAY_CAPABILITY_CATALOG,
 };
 pub use config::{AccessPolicy, Config, EphemeralPersistence, Preset, StrfryConfigTranslation};
@@ -26,7 +26,7 @@ pub use moderation::{
 pub use protocol::{ClientCommand, EoseHints, RelayMessage};
 pub use rlimit::apply_nofiles_limit;
 pub use server::{
-    start, BoundAddresses, ConnectionGuard, HeldMessages, Outbound, OutboundFrame, RelayHandle,
-    HELD_MESSAGE_OVERHEAD,
+    start, start_without_maintenance, BoundAddresses, ConnectionGuard, HeldMessages, Outbound,
+    OutboundFrame, RelayHandle, HELD_MESSAGE_OVERHEAD,
 };
 pub use source::TransportSource;

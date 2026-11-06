@@ -1,7 +1,7 @@
 # Relay functions reached in the `unix` profile, beyond startup.
 # Written by scripts/attack-surface-reach.py --bless; see docs/attack-surface.md.
 
-## anonymous: 760
+## anonymous: 771
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::find_lower_bound
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::iterate::<<wok_negentropy::protocol::Negentropy<&mut wok_negentropy::vector::Vector>>::reconcile_aux::{closure}>
 <&mut wok_negentropy::vector::Vector as wok_negentropy::storage::Storage>::size
@@ -33,6 +33,7 @@
 <wok_event::error::EventError>::broken_limit
 <wok_event::error::EventError>::msg::<&str>
 <wok_event::error::EventError>::msg::<alloc::string::String>
+<wok_event::error::EventError>::rejection_prefix
 <wok_event::json::Parser>::bump
 <wok_event::json::Parser>::consume_digits
 <wok_event::json::Parser>::err
@@ -293,6 +294,8 @@
 <wok_relay::abuse::OpenConnections>::release
 <wok_relay::abuse::Principal>::address
 <wok_relay::capabilities::CapabilityCondition>::is_enabled
+<wok_relay::capabilities::NipId as core::fmt::Display>::fmt
+<wok_relay::capabilities::NipId>::named
 <wok_relay::config::Config>::accepts_kind
 <wok_relay::config::Config>::auth_required
 <wok_relay::config::Config>::auth_usable
@@ -557,8 +560,12 @@ wok_db::txn::foreach_full::<wok_db::write::lookup_event_by_id::{closure}>
 wok_db::txn::foreach_full::<wok_db::write::write_events_with_quota<wok_negentropy::cache::BatchSink, u64>::{closure}>
 wok_db::txn::foreach_full::<wok_relay::server::negentropy::public_tree_allowed::{closure}>
 wok_db::txn::position_reverse_dup
-wok_db::vanish::is_event_vanished_ro
-wok_db::vanish::is_event_vanished_rw
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_ro_with_json::{closure}, wok_db::vanish::is_event_vanished_ro_with_json::{closure}>
+wok_db::vanish::event_vanished::<wok_db::vanish::is_event_vanished_rw_with_json::{closure}, wok_db::vanish::is_event_vanished_rw_with_json::{closure}>
+wok_db::vanish::is_event_vanished_ro_with_json
+wok_db::vanish::is_event_vanished_ro_with_json::{closure}
+wok_db::vanish::is_event_vanished_rw_with_json
+wok_db::vanish::is_event_vanished_rw_with_json::{closure}
 wok_db::vanish::normalize_relay_url
 wok_db::vanish::vanish_timestamp_ro
 wok_db::vanish::vanish_timestamp_rw
@@ -575,6 +582,9 @@ wok_db::write::put_indices
 wok_db::write::replace_key
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>
 wok_db::write::write_events_with_quota::<wok_negentropy::cache::BatchSink, u64>::{closure}
+wok_event::deletion_protection::deletion_protection
+wok_event::deletion_protection::deletion_protection::{closure}
+wok_event::deletion_protection::deletion_protection::{closure}::{closure}
 wok_event::hash::id_preimage
 wok_event::hash::sha256
 wok_event::hash::verify_id
@@ -748,6 +758,7 @@ wok_ws::landing
 wok_ws::landing::{closure}
 wok_ws::landing::{closure}::{closure}
 wok_ws::nip11
+wok_ws::nip11::{closure}
 wok_ws::nip86::dispatch
 wok_ws::nip86::dispatch::{closure}
 wok_ws::nip_description

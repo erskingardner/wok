@@ -9,6 +9,7 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
 pub mod comparators;
+mod deletion_protection;
 #[cfg(not(feature = "rocksdb-backend"))]
 pub mod env;
 #[cfg(feature = "rocksdb-backend")]
@@ -43,6 +44,7 @@ pub mod txn;
 pub mod vanish;
 pub mod write;
 
+pub use deletion_protection::is_deletion_protected_json;
 pub use env::{lmdb_version, Env, EnvOptions, EnvironmentStats};
 pub use error::DbError;
 pub use fbs::{
@@ -95,16 +97,17 @@ pub use search::{
     SEARCH_BUILD_STEP_BUDGET, SEARCH_BUILD_STEP_EVENTS,
 };
 pub use tag_kind::{
-    backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index,
+    backfill_tag_kind_index, defer_tag_kind_postings, reset_tag_kind_index, skip_tag_kind_postings,
     tag_kind_index_complete_ro, tag_kind_index_state_ro, tag_kind_key, TagKindBackfillStep,
     TagKindBulkPass, TagKindIndexState, TAG_KIND_SCHEMA_VERSION, TAG_KIND_STEP_BUDGET,
     TAG_KIND_STEP_ENTRIES,
 };
 pub use txn::{RoTxn, RwTxn};
 pub use vanish::{
-    backfill_vanish_markers, gift_wrap_vanished, is_event_vanished_ro, is_event_vanished_rw,
-    mark_vanished, normalize_relay_url, sweep_vanished_events, vanish_timestamp_ro,
-    vanish_timestamp_rw, VanishPolicy, VanishSweepCursor, VanishSweepStep, ALL_RELAYS, VANISH_KIND,
+    backfill_vanish_markers, gift_wrap_vanished, is_event_vanished_ro,
+    is_event_vanished_ro_with_json, mark_vanished, normalize_relay_url, sweep_vanished_events,
+    vanish_timestamp_ro, vanish_timestamp_rw, VanishPolicy, VanishSweepCursor, VanishSweepStep,
+    ALL_RELAYS, VANISH_KIND,
 };
 pub use write::{
     delete_event_basic, delete_events, lookup_event_by_id, most_recent_levid, write_events,

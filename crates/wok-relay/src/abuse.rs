@@ -412,6 +412,49 @@ mod tests {
     }
 
     #[test]
+    fn marmot_accepts_an_add_member_burst_that_exceeds_public_capacity() {
+        let public = crate::Config::default();
+        let marmot = crate::Config::parse_toml(
+            "preset = \"marmot\"\n[relay.auth]\nservice_url = \"wss://marmot.test\"\n",
+        )
+        .unwrap();
+        let now = Instant::now();
+        for (name, config, accepted) in [("public", public, 100), ("marmot", marmot, 251)] {
+            assert!(config.relay.abuse.enabled);
+            let (rate, burst) = spec(BudgetKind::Event, &config.relay.abuse);
+            assert!(rate > 0 && burst > 0);
+            let mut bucket = Bucket::new(now);
+            // One commit plus 250 Welcomes at one instant: host speed cannot
+            // refill the bucket between admission checks.
+            for event in 0..251 {
+                let expected = if event < accepted {
+                    Admission::Admitted
+                } else if event == accepted {
+                    Admission::FirstRefusal
+                } else {
+                    Admission::Refused
+                };
+                assert_eq!(
+                    bucket.admit(now, rate, burst),
+                    expected,
+                    "{name}: event {event}"
+                );
+            }
+            // The same total spread over time is valid under both presets.
+            // A sequential network publisher must not be expected to exhaust
+            // the public bucket when each acknowledgement takes long enough.
+            let mut bucket = Bucket::new(now);
+            for event in 0..251 {
+                assert_eq!(
+                    bucket.admit(now + Duration::from_secs(event), rate, burst),
+                    Admission::Admitted,
+                    "{name}: spaced event {event}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn an_address_holds_at_most_its_cap_of_connections() {
         let mut cfg = crate::Config::default().relay.abuse;
         cfg.max_connections_per_address = 2;

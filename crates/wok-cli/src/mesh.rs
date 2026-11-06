@@ -113,12 +113,9 @@ fn parse_supported_nips(document: &Value) -> anyhow::Result<HashSet<u64>> {
     let nips = nips
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("supported_nips is not an array"))?;
-    nips.iter()
-        .map(|nip| {
-            nip.as_u64()
-                .ok_or_else(|| anyhow::anyhow!("supported_nips contains a non-integer"))
-        })
-        .collect()
+    // Only numeric capabilities affect routing. Unknown entries and extension
+    // metadata cannot suppress an advertised numeric NIP-91.
+    Ok(nips.iter().filter_map(Value::as_u64).collect())
 }
 
 async fn relay_supported_nips(relay_url: &str) -> Result<Arc<HashSet<u64>>, Arc<str>> {
@@ -349,19 +346,24 @@ mod tests {
 
     #[tokio::test]
     async fn advertised_nip91_preserves_and_fields() {
-        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11,91]}"#).await;
-        let filter = serde_json::json!({"&t":["a","b"],"#t":["a","b","c"]});
-        assert_eq!(
-            outbound_filter_for_relay(&url, &filter).await.unwrap(),
-            filter
-        );
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        server.abort();
+        for document in [
+            r#"{"supported_nips":[1,11,91]}"#,
+            r#"{"supported_nips":[1,11,91,"5A","D9"]}"#,
+        ] {
+            let (url, requests, server) = nip11_server(document).await;
+            let filter = serde_json::json!({"&t":["a","b"],"#t":["a","b","c"]});
+            assert_eq!(
+                outbound_filter_for_relay(&url, &filter).await.unwrap(),
+                filter
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
     }
 
     #[tokio::test]
     async fn unsupported_nip91_folds_and_values_into_the_compatibility_clause() {
-        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11]}"#).await;
+        let (url, requests, server) = nip11_server(r#"{"supported_nips":[1,11,"91","D9"]}"#).await;
         let filter = serde_json::json!({
             "&t":["a","b"],
             "#t":["b","c"],
@@ -497,10 +499,38 @@ mod tests {
     }
 
     #[test]
-    fn supported_nips_require_integer_entries() {
-        let nips = parse_supported_nips(&serde_json::json!({"supported_nips":[77,91]})).unwrap();
-        assert!(nips.contains(&77));
-        assert!(nips.contains(&91));
-        assert!(parse_supported_nips(&serde_json::json!({"supported_nips":["91"]})).is_err());
+    fn unrelated_wok_metadata_cannot_disable_numeric_nip91() {
+        for extensions in [
+            serde_json::json!(["D9"]),
+            serde_json::json!([217]),
+            serde_json::json!(null),
+        ] {
+            let nips = parse_supported_nips(&serde_json::json!({
+                "supported_nips": [1, 11, 91],
+                "wok": {"supported_nips": extensions},
+            }))
+            .unwrap();
+            assert!(nips.contains(&91));
+        }
+        let named_only = parse_supported_nips(&serde_json::json!({
+            "wok": {"supported_nips": ["91"]},
+        }))
+        .unwrap();
+        assert!(!named_only.contains(&91));
+    }
+
+    #[test]
+    fn supported_nips_ignore_unknown_entries_without_numeric_aliases() {
+        let nips = parse_supported_nips(&serde_json::json!({
+            "supported_nips": [77,91,"5A","D9","91",-1,91.5,true,null,[],{}],
+        }))
+        .unwrap();
+        assert_eq!(nips, HashSet::from([77, 91]));
+        assert!(
+            parse_supported_nips(&serde_json::json!({"supported_nips":["91"]}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_supported_nips(&serde_json::json!({"supported_nips":91})).is_err());
     }
 }

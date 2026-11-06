@@ -202,8 +202,8 @@ include waiting before send. Wok reduced read p99 versus strfry by **34–61% in
 all 16 matched cases**, with a worse rare read tail in one run. Finite,
 prewarmed runs do not establish maximum capacity
 or equal power-loss durability. Writers used different authors from the queries.
-A separate one-hour correctness soak covered 500-author latest feeds during
-writes to queried authors, live delivery, restart and acknowledged-write
+A separate one-hour correctness soak checked 500-author latest feeds between
+write batches, live delivery, restart and acknowledged-write
 process-crash recovery.
 
 Results describe the measured RocksDB candidate at

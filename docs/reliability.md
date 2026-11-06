@@ -140,6 +140,11 @@ The workload includes:
   audits after each stop and at the end. The final primary event count must
   match the driver's complete stored-event model.
 
+Historical queries, latest-feed checks, COUNT and negentropy run between fully
+acknowledged publication batches. Live subscriptions stay open during
+publication. Simultaneous fixed-rate query/write measurements use the
+[matched campaign](../tools/relay-matched/README.md).
+
 Each run records hashes of the relay, driver, config and initial signed corpus;
 Linux/cgroup details; per-process RSS, anonymous memory, CPU time, thread count,
 and database size sampled every five seconds; raw metrics; latency distributions; process logs; and final

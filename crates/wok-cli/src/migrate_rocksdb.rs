@@ -152,6 +152,9 @@ mod enabled {
     }
 
     fn paths(options: &Options) -> Result<(PathBuf, PathBuf)> {
+        if options.source.to_str().is_none() || options.output.to_str().is_none() {
+            bail!("source and output paths must be valid UTF-8 for the migration manifest");
+        }
         let source = options
             .source
             .canonicalize()
@@ -354,7 +357,8 @@ mod tests {
             .path()
             .join(OsString::from_vec(b"source-\xff".to_vec()));
         let valid = root.path().join("source");
-        std::fs::create_dir(&invalid).unwrap();
+        // APFS rejects invalid UTF-8 names itself; argument rejection must work
+        // before filesystem access on every platform.
         std::fs::create_dir(&valid).unwrap();
         for (source, output) in [
             (invalid.clone(), root.path().join("output")),
@@ -378,7 +382,7 @@ mod tests {
             assert!(format!("{error:#}").contains("--features rocksdb"));
             assert!(!output.exists());
         }
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[cfg(not(feature = "rocksdb-author-heads"))]

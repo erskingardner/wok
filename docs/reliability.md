@@ -85,6 +85,14 @@ python3 scripts/reliability-soak.py \
   --seconds 3600 --seed 4242 --out /tmp/wok-soak-run-1
 ```
 
+LMDB is the default build and soak backend. To exercise the optimized RocksDB
+build, add `--features rocksdb` to the CLI build and `--backend rocksdb` to the
+runner. Use separate target/output directories for the two builds, as shown in
+[releases.md](releases.md). The runner checks `wok storage-backend` before
+starting; it refuses a binary whose backend does not match the requested run.
+RocksDB needs Rust 1.88+, a C++ compiler and libclang. The load driver itself
+speaks WS/Unix and does not choose the relay's storage backend.
+
 Python 3.11+ and Linux `/proc` are required. The runner creates disposable storage
 and loopback listeners, never resets an existing database, and refuses to reuse
 an output directory. `--port` defaults to 17777. The driver uses both transports
@@ -92,18 +100,32 @@ against one relay process and runs approximately one mixed round per second.
 
 The workload includes:
 
-- 20,000 seeded initial notes, followed by a bounded rotating set of 256 notes,
-  64 addressable replaceable events, and four deletion events.
+- 20,000 initial base notes plus 498 author-feed seed notes, followed by a
+  bounded rotating set of notes, 64 addressable replaceable events and batched
+  deletion requests every 15 rounds.
 - Eight publisher connections, four fast live subscribers, two slow subscribers,
   and periodic reconnects.
 - Exact per-event receipts and fast-subscriber payload checks.
 - Historical queries and COUNT on both transports every 15 rounds, followed by
   multi-round negentropy against the full expected set.
+- Two additional same-author note streams, retained with bounded batched
+  deletion, within a 500-author filter. Both transports check live bodies,
+  newest-50 order and complete COUNT as those authors keep appending. The
+  other 498 author ranges each contain one signed seed note older than the
+  active streams, so the filter exercises populated author ranges. Distinct
+  timestamps make the exact ordered answer unambiguous.
 - Separate 512 KiB ephemeral bursts to pressure slow subscribers without growing
   the durable dataset. Slow-reader closure must be observed in runs of at least
   three minutes.
-- A midpoint SIGTERM shutdown, offline integrity check, restart, and exact
-  post-restart history verification; final integrity after shutdown.
+- A midpoint SIGTERM shutdown and a later deliberate SIGKILL after a fully
+  acknowledged batch, each followed by offline integrity, reopen and exact
+  history/feed/COUNT/negentropy verification. These are process-crash and
+  acknowledged-data recovery checks, not a power-loss or in-flight-transaction
+  guarantee. Very short canaries can extend past the requested mixed duration
+  to finish both recovery phases.
+- Full offline RocksDB primary, signature, derived-index and author-frontier
+  audits after each stop and at the end. The final primary event count must
+  match the driver's complete stored-event model.
 
 Each run records hashes of the relay, driver, config and initial signed corpus;
 Linux/cgroup details; per-process RSS, anonymous memory, CPU time, thread count,
@@ -112,7 +134,11 @@ results. Keys are seeded; the initial corpus records its actual timestamps and s
 Mixed-workload events use the live clock and are not retained as a complete
 replay stream, so a seed alone does not reproduce every event byte.
 
-Sampled budgets are 768 MiB relay RSS and 512 MiB database size. Five-second
+Database size counts all regular files below the owned database directory,
+including RocksDB WAL/SST files and LMDB data/lock files. Paths containing
+symlinks are rejected; a file removed by compaction during a sample is skipped.
+These directory samples are not atomic storage snapshots. Sampled budgets are 768 MiB relay RSS and 512 MiB
+database size. Five-second
 sampling can miss shorter resource spikes; these are not continuous peak measurements. For each process lifetime,
 after 120 seconds of warmup, growth between the first and last six anonymous-RSS
 samples must remain within 64 MiB. Short canaries may have no eligible growth
@@ -125,7 +151,9 @@ The config allows a 30,000-event query and 16 MiB per-connection outbound queue
 for this dataset. Rate limiting is disabled to isolate storage/transport
 reliability; admission-limit behavior is covered separately by integration tests.
 Fixtures retain the host's inherited file-descriptor limit (`nofiles = 0`).
-Normal synchronous LMDB durability is retained. The resource cap does not cover
+Normal synchronous LMDB commits or synchronous RocksDB WAL batches are retained.
+These are workload budgets, not the storage engines' production memory limits.
+The resource cap does not cover
 the load driver's memory; container limits and host details are recorded.
 
 This workload checks periodic sync during continuing relay operation. It does

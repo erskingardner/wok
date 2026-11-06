@@ -8,10 +8,13 @@ from pathlib import Path
 import platform
 import resource
 import signal
+import stat
 import subprocess
 import sys
 import time
 import urllib.request
+
+BACKENDS = {"lmdb": "lmdb", "rocksdb": "rocksdb-author-heads-experimental"}
 
 
 def digest(path):
@@ -20,7 +23,9 @@ def digest(path):
 
 
 def stop(child):
-    if child is not None and child.poll() is None:
+    if child is None:
+        return
+    if child.poll() is None:
         child.send_signal(signal.SIGTERM)
         try:
             child.wait(timeout=15)
@@ -28,8 +33,57 @@ def stop(child):
             child.kill()
             child.wait()
             raise RuntimeError("relay did not stop gracefully")
-        if child.returncode != 0:
-            raise RuntimeError(f"relay exited {child.returncode}")
+    if child.returncode != 0:
+        raise RuntimeError(f"relay exited {child.returncode}")
+
+
+def database_bytes(path):
+    """Sample logical backend bytes; compaction may unlink a listed SST."""
+    total = 0
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"expected a plain database directory: {path}")
+    for parent, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            entry = Path(parent) / name
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                # RocksDB can retire a compacted SST after os.walk listed it.
+                # This is a sample rather than an atomic storage snapshot.
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"database symlink outside bounded scratch: {entry}")
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
+
+
+def verify_backend(wok, backend):
+    actual = subprocess.run([str(wok.resolve()), "storage-backend"], capture_output=True,
+                            text=True, check=True, timeout=15).stdout.strip()
+    if actual != BACKENDS[backend]:
+        raise RuntimeError(f"requested {backend}, binary reports {actual!r}; expected {BACKENDS[backend]!r}")
+    return actual
+
+
+def validate_driver_result(result):
+    if not (result.get("ok") is True and result.get("restart_verified") is True
+            and result.get("crash_recovery_verified") is True
+            and result.get("feed_author_count") == 500 and result.get("author_feed_checks", 0) >= 6
+            and result.get("author_live_deliveries", 0) > 0):
+        raise RuntimeError("driver did not verify both recovery phases and the active 500-author feed")
+
+
+def crash(child, evidence):
+    """Record the one deliberate owned-process crash without treating it as exit0."""
+    if child.poll() is not None:
+        raise RuntimeError(f"relay exited before controlled crash: {child.returncode}")
+    child.kill()
+    code = child.wait(timeout=15)
+    evidence.write_text(json.dumps({"intentional": True, "actual_returncode": code,
+                        "signal": "SIGKILL", "scope": "acknowledged data; not power loss"}))
+    if code != -signal.SIGKILL:
+        raise RuntimeError(f"controlled crash exited {code}")
 
 
 def ready(child, url):
@@ -53,7 +107,7 @@ def sample(pid, root, started):
             "rss_kib": int(status.get("VmRSS", "0 kB").split()[0]),
             "anonymous_kib": int(status.get("RssAnon", "0 kB").split()[0]),
             "cpu_seconds": (int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK"),
-            "threads": int(status["Threads"]), "db_bytes": (root / "db/data.mdb").stat().st_size}
+            "threads": int(status["Threads"]), "db_bytes": database_bytes(root / "db")}
 
 
 def main():
@@ -64,6 +118,8 @@ def main():
     parser.add_argument("--seconds", type=int, default=3600)
     parser.add_argument("--seed", type=int, default=4242)
     parser.add_argument("--port", type=int, default=17777)
+    parser.add_argument("--backend", choices=BACKENDS, default="lmdb",
+                        help="Expected build; LMDB remains the default. RocksDB requires the optimized rocksdb feature.")
     args = parser.parse_args()
     if sys.platform != "linux" or not 10 <= args.seconds <= 21600:
         parser.error("requires Linux and a duration between 10 and 21600 seconds")
@@ -100,7 +156,11 @@ max_pending_outbound_bytes = 16777216
                 "nofile_limits": resource.getrlimit(resource.RLIMIT_NOFILE),
                 "seconds_requested": args.seconds, "seed": args.seed, "wok_sha256": digest(args.wok),
                 "driver_sha256": digest(args.driver), "config_sha256": digest(cfg),
-                "durability": "normal LMDB synchronous commits", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "backend": args.backend,
+                "durability": "synchronous RocksDB WAL batches" if args.backend == "rocksdb" else "normal LMDB synchronous commits",
+                "db_size_scope": "all regular database files, including WAL/SST/metadata; logical bytes",
+                "crash_scope": "one intentional SIGKILL after an acknowledged batch; not in-flight writes or power loss",
+                "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "memory_policy": {"rss_max_mib": 768, "anonymous_growth_max_mib_after_120s_warmup": 64}}
     for name in ["cpu.max", "memory.max", "memory.swap.max"]:
         path = Path("/sys/fs/cgroup") / name
@@ -130,8 +190,21 @@ max_pending_outbound_bytes = 16777216
     def integrity(name):
         with open(root / name, "w") as log:
             subprocess.run([str(args.wok.resolve()), "--config", str(cfg), "integrity"], stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+        if args.backend == "rocksdb":
+            path = root / name.replace("-integrity.txt", "-rocksdb-audit.json")
+            with path.open("x") as log:
+                subprocess.run([str(args.wok.resolve()), "--config", str(cfg), "rocksdb-check"],
+                               stdout=log, stderr=relay_log, check=True, timeout=120)
+            audit = json.loads(path.read_text())
+            if not (audit.get("ok") is True and audit.get("author_head_records_verified", 0) > 0
+                    and audit.get("author_frontier_positions_verified", 0) > 0):
+                raise RuntimeError("RocksDB primary/index/author-frontier audit failed")
+            return audit
+        return None
 
     try:
+        metadata["binary_storage_backend"] = verify_backend(args.wok, args.backend)
+        (root / "manifest.json").write_text(json.dumps(metadata, indent=2))
         relay = launch()
         load = subprocess.Popen([str(args.driver.resolve()), f"ws://127.0.0.1:{args.port}", f"unix://{unix}", str(args.seconds), str(root), str(args.seed)], stdout=driver_log, stderr=driver_err)
         next_sample = 0
@@ -144,9 +217,18 @@ max_pending_outbound_bytes = 16777216
                     raise RuntimeError(f"relay unexpectedly exited {relay.returncode}")
                 if (root / "restart.request").exists() and not (root / "restart.ready").exists():
                     stop(relay)
+                    relay = None
                     integrity("restart-integrity.txt")
                     relay = launch()
                     (root / "restart.ready").write_text("ready")
+                if (root / "crash.request").exists() and not (root / "crash.ready").exists():
+                    # All receipts and live payloads were checked before this request.
+                    # Only this owned relay is killed; its scratch DB and logs remain.
+                    crash(relay, root / "crash-exit.json")
+                    relay = None
+                    integrity("crash-integrity.txt")
+                    relay = launch()
+                    (root / "crash.ready").write_text("ready")
                 if time.monotonic() >= next_sample:
                     row = sample(relay.pid, root, started)
                     samples.append(row)
@@ -164,7 +246,8 @@ max_pending_outbound_bytes = 16777216
         if load.returncode != 0:
             raise RuntimeError(f"load driver failed ({load.returncode}); see driver.stderr")
         stop(relay)
-        integrity("final-integrity.txt")
+        relay = None
+        final_audit = integrity("final-integrity.txt")
         growth = []
         for pid in sorted({s["pid"] for s in samples}):
             rows = [s for s in samples if s["pid"] == pid]
@@ -175,9 +258,13 @@ max_pending_outbound_bytes = 16777216
                 if change > 64 * 1024:
                     raise RuntimeError(f"anonymous memory grew by {change} KiB after warmup")
         driver = json.loads((root / "driver-result.json").read_text())
+        validate_driver_result(driver)
+        if final_audit is not None and final_audit["events"] != driver["stored"]:
+            raise RuntimeError("offline RocksDB primary count differs from the exact driver model")
         result = {"ok": True, "driver": driver, "peak_rss_kib": max(s["rss_kib"] for s in samples),
+                  "backend": args.backend, "binary_storage_backend": metadata["binary_storage_backend"],
                   "peak_anonymous_kib": max(s["anonymous_kib"] for s in samples), "memory_segments": growth,
-                  "final_db_bytes": samples[-1]["db_bytes"], "samples": len(samples), "corpus_sha256": digest(root / "corpus.jsonl")}
+                  "final_db_bytes": database_bytes(root / "db"), "samples": len(samples), "corpus_sha256": digest(root / "corpus.jsonl")}
         (root / "result.json").write_text(json.dumps(result, indent=2))
         print(json.dumps(result))
     except BaseException as error:
@@ -200,6 +287,9 @@ max_pending_outbound_bytes = 16777216
                 raise
         finally:
             socket_dir.cleanup()
+            relay_log.close()
+            driver_log.close()
+            driver_err.close()
 
 
 if __name__ == "__main__":

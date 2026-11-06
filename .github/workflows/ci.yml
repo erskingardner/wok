@@ -13,18 +13,41 @@ concurrency:
 
 jobs:
   test:
+    name: stable / ${{ matrix.backend }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: lmdb
+            features: ''
+          - backend: rocksdb
+            features: '--features wok-cli/rocksdb'
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target/ci-${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v6
+      - name: RocksDB native build dependencies
+        if: matrix.backend == 'rocksdb'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: fmt
+        if: matrix.backend == 'lmdb'
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --locked
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+      - name: Workspace tests, including storage recovery, migration and author frontiers
+        run: cargo test --workspace --locked ${{ matrix.features }}
+      - name: Script guards
+        if: matrix.backend == 'lmdb'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          python3 -m unittest discover -s scripts/tests -v
 
   migration:
     name: pinned strfry migration compatibility
@@ -57,13 +80,31 @@ jobs:
           cargo test -p wok-cli --test migration_cpp --locked
 
   msrv:
-    name: rust 1.85 minimum version
+    name: rust ${{ matrix.rust }} / ${{ matrix.backend }} minimum version
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: lmdb
+            rust: 1.85.0
+            features: ''
+          - backend: rocksdb
+            rust: 1.88.0
+            features: '--features wok-cli/rocksdb'
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: target/msrv-${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: RocksDB native build dependencies
+        if: matrix.backend == 'rocksdb'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang libclang-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
       - name: Check workspace at declared MSRV
         run: |
-          rustup run 1.85.0 rustc --version
-          rustup run 1.85.0 cargo --version
-          rustup run 1.85.0 cargo check --workspace --all-targets --locked
+          rustup run '${{ matrix.rust }}' rustc --version
+          rustup run '${{ matrix.rust }}' cargo check --workspace --all-targets --locked ${{ matrix.features }}

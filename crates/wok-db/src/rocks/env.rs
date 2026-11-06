@@ -8,6 +8,11 @@ use lmdb_sys::*;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "rocksdb-memory-diagnostics")]
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 #[derive(Clone, Debug)]
 pub struct EnvOptions {
     pub max_readers: u32,
@@ -97,6 +102,8 @@ pub struct EnvInner {
     /// Published only after its synchronous WriteBatch completes. The sequence
     /// couples these tiny immutable metadata values to every read snapshot.
     pub(crate) marker_state: Mutex<Option<MarkerState>>,
+    #[cfg(feature = "rocksdb-memory-diagnostics")]
+    memory_diagnostics: MemoryDiagnostics,
 }
 #[derive(Clone)]
 pub struct Env {
@@ -109,6 +116,23 @@ pub(crate) fn native_options(
     fresh: bool,
     names: impl IntoIterator<Item = &'static str>,
 ) -> (rocksdb::Options, Vec<rocksdb::ColumnFamilyDescriptor>) {
+    let native = make_native_options(fresh, names);
+    (native.options, native.cfs)
+}
+
+struct NativeOptions {
+    options: rocksdb::Options,
+    cfs: Vec<rocksdb::ColumnFamilyDescriptor>,
+    #[cfg(feature = "rocksdb-memory-diagnostics")]
+    row_cache: rocksdb::Cache,
+}
+
+const ROW_CACHE_CAPACITY: usize = 2 << 30;
+
+fn make_native_options(
+    fresh: bool,
+    names: impl IntoIterator<Item = &'static str>,
+) -> NativeOptions {
     use rocksdb::{
         BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DataBlockIndexType,
         Options,
@@ -140,12 +164,18 @@ pub(crate) fn native_options(
     options.set_db_write_buffer_size(2 << 30);
     options.set_max_total_wal_size(1 << 30);
     options.set_bytes_per_sync(1 << 20);
-    options.set_row_cache(&Cache::new_lru_cache(2 << 30));
+    let row_cache = Cache::new_lru_cache(ROW_CACHE_CAPACITY);
+    options.set_row_cache(&row_cache);
     let cfs = names
         .into_iter()
         .map(|n| ColumnFamilyDescriptor::new(n, cfopts()))
         .collect::<Vec<_>>();
-    (options, cfs)
+    NativeOptions {
+        options,
+        cfs,
+        #[cfg(feature = "rocksdb-memory-diagnostics")]
+        row_cache,
+    }
 }
 
 /// Inspect the manifest without opening a writer or creating missing CFs.
@@ -242,7 +272,12 @@ impl Env {
                 .map_err(err)?;
             }
         }
-        let (mut options, cfs) = native_options(fresh, physical_cf_names());
+        let NativeOptions {
+            mut options,
+            cfs,
+            #[cfg(feature = "rocksdb-memory-diagnostics")]
+            row_cache,
+        } = make_native_options(fresh, physical_cf_names());
         if opts.read_only {
             // Read-only maintenance must not rotate LOG or persist open-time
             // statistics, even though those files are outside the key space.
@@ -267,15 +302,37 @@ impl Env {
             }
             _ => return Err(err("unsupported or absent Wok RocksDB layout marker")),
         }
-        Self::from_native_db(db, path, opts.read_only)
+        Self::from_native_db_inner(
+            db,
+            path,
+            opts.read_only,
+            #[cfg(feature = "rocksdb-memory-diagnostics")]
+            Some(row_cache),
+        )
     }
 
     // Callers must validate their exact layout and marker before construction.
-    // Ordinary opens do so above; the test-only pending-audit adapter is read-only.
+    // Ordinary opens do so above; offline migration and pending-audit adapters
+    // validate their own exact pending layout. Their cache handles are unknown.
     pub(crate) fn from_native_db(
         db: rocksdb::DB,
         path: &Path,
         read_only: bool,
+    ) -> Result<Self, DbError> {
+        Self::from_native_db_inner(
+            db,
+            path,
+            read_only,
+            #[cfg(feature = "rocksdb-memory-diagnostics")]
+            None,
+        )
+    }
+
+    fn from_native_db_inner(
+        db: rocksdb::DB,
+        path: &Path,
+        read_only: bool,
+        #[cfg(feature = "rocksdb-memory-diagnostics")] row_cache: Option<rocksdb::Cache>,
     ) -> Result<Self, DbError> {
         let dbis = Dbis {
             meta: 1,
@@ -312,6 +369,8 @@ impl Env {
                 read_only,
                 protection_cache: Default::default(),
                 writer: Mutex::new(()),
+                #[cfg(feature = "rocksdb-memory-diagnostics")]
+                memory_diagnostics: MemoryDiagnostics::new(row_cache),
             }),
         })
     }
@@ -332,12 +391,16 @@ impl Env {
         self.inner.dbis
     }
     pub fn begin_ro(&self) -> Result<RoTxn<'_>, DbError> {
+        #[cfg(feature = "rocksdb-memory-diagnostics")]
+        self.inner.sample_memory_if_due();
         RoTxn::begin(self)
     }
     pub fn begin_rw(&self) -> Result<RwTxn<'_>, DbError> {
         if self.inner.read_only {
             return Err(err("database environment was opened read-only"));
         }
+        #[cfg(feature = "rocksdb-memory-diagnostics")]
+        self.inner.sample_memory_if_due();
         let version = self.db_version()?;
         if version != 0 && version != wok_event::WOK_DB_VERSION {
             return Err(err("database version is read-only; migration required"));
@@ -488,44 +551,197 @@ impl Env {
     }
 }
 
-#[cfg(feature = "rocksdb-read-diagnostics")]
-impl Drop for EnvInner {
-    fn drop(&mut self) {
-        // Observe, never force flush/compaction. This happens after relay threads
-        // join and before RocksDB's own destructor; final child rusage captures
-        // subsequent shutdown I/O as well.
-        let mut cf_stats = serde_json::Map::new();
-        for name in physical_cf_names() {
-            let Some(cf) = self.db.cf_handle(name) else {
-                continue;
-            };
-            let properties = [
-                "rocksdb.background-errors",
-                "rocksdb.estimate-pending-compaction-bytes",
-                "rocksdb.compaction-pending",
-                "rocksdb.mem-table-flush-pending",
-                "rocksdb.estimate-table-readers-mem",
-                "rocksdb.cur-size-all-mem-tables",
-                "rocksdb.block-cache-usage",
-            ];
-            let values = properties
-                .into_iter()
-                .map(|key| {
-                    (
-                        key.to_string(),
-                        match self.db.property_int_value_cf(cf, key) {
-                            Ok(Some(n)) => serde_json::json!(n),
-                            Ok(None) => serde_json::Value::Null,
-                            Err(e) => serde_json::json!({"error":e.to_string()}),
-                        },
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>();
-            cf_stats.insert(name.to_string(), serde_json::Value::Object(values));
+#[cfg(feature = "rocksdb-memory-diagnostics")]
+struct MemoryDiagnostics {
+    started: Instant,
+    next_sample_millis: AtomicU64,
+    // Native options and DB already retain this same cache. This extra handle
+    // observes it; it creates no new cache and cannot change its capacity.
+    row_cache: Option<rocksdb::Cache>,
+}
+
+#[cfg(feature = "rocksdb-memory-diagnostics")]
+impl MemoryDiagnostics {
+    const INTERVAL_MILLIS: u64 = 15_000;
+
+    fn new(row_cache: Option<rocksdb::Cache>) -> Self {
+        Self {
+            started: Instant::now(),
+            next_sample_millis: AtomicU64::new(0),
+            row_cache,
         }
-        eprintln!(
-            "WOK_ROCKSDB_FINAL_STATS {}",
-            serde_json::json!({"column_families":cf_stats,"policy":"sync WAL per committed application batch; no forced settlement"})
+    }
+
+    fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn claim_sample(&self, now: u64) -> bool {
+        let deadline = self.next_sample_millis.load(Ordering::Relaxed);
+        now >= deadline
+            && self
+                .next_sample_millis
+                .compare_exchange(
+                    deadline,
+                    now.saturating_add(Self::INTERVAL_MILLIS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+    }
+}
+
+#[cfg(feature = "rocksdb-memory-diagnostics")]
+impl EnvInner {
+    fn sample_memory_if_due(&self) {
+        if self
+            .memory_diagnostics
+            .claim_sample(self.memory_diagnostics.elapsed_millis())
+        {
+            self.emit_memory_sample("transaction_boundary");
+        }
+    }
+
+    fn memory_sample(&self, phase: &str) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+        let observed_unix_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        let property =
+            |cf: &rocksdb::ColumnFamily, key: &str| match self.db.property_int_value_cf(cf, key) {
+                Ok(Some(value)) => json!(value),
+                Ok(None) => Value::Null,
+                Err(error) => json!({"error": error.to_string()}),
+            };
+        let mut column_families = Map::new();
+        for name in physical_cf_names() {
+            let values = match self.db.cf_handle(name) {
+                Some(cf) => [
+                    "rocksdb.cur-size-active-mem-table",
+                    "rocksdb.cur-size-all-mem-tables",
+                    "rocksdb.size-all-mem-tables",
+                    "rocksdb.estimate-table-readers-mem",
+                    "rocksdb.num-live-versions",
+                    "rocksdb.estimate-pending-compaction-bytes",
+                    "rocksdb.mem-table-flush-pending",
+                    "rocksdb.compaction-pending",
+                    "rocksdb.background-errors",
+                ]
+                .into_iter()
+                .map(|key| (key.to_string(), property(cf, key)))
+                .collect::<Map<_, _>>(),
+                None => Map::from_iter([("unavailable".to_string(), json!(true))]),
+            };
+            column_families.insert(name.to_string(), Value::Object(values));
+        }
+        let mut database = Map::new();
+        if let Some(cf) = self.db.cf_handle("default") {
+            // These are DB-wide or shared-cache values. Repeating them for
+            // every CF would invite counting the same allocation many times.
+            for key in [
+                "rocksdb.num-snapshots",
+                "rocksdb.oldest-snapshot-time",
+                "rocksdb.oldest-snapshot-sequence",
+                "rocksdb.num-running-flushes",
+                "rocksdb.num-running-compactions",
+                "rocksdb.block-cache-capacity",
+                "rocksdb.block-cache-usage",
+                "rocksdb.block-cache-pinned-usage",
+            ] {
+                database.insert(key.to_string(), property(cf, key));
+            }
+        }
+        let row_cache = match &self.memory_diagnostics.row_cache {
+            Some(cache) => json!({
+                "available": true,
+                "capacity_bytes": ROW_CACHE_CAPACITY,
+                "usage_bytes": cache.get_usage(),
+                "pinned_usage_bytes": cache.get_pinned_usage(),
+            }),
+            None => json!({
+                "available": false,
+                "reason": "native DB adapter did not supply its row-cache handle",
+            }),
+        };
+        json!({
+            "format": "wok-rocksdb-memory-sample-v1",
+            "phase": phase,
+            "process_id": std::process::id(),
+            "database_path": self.path.to_str(),
+            "read_only": self.read_only,
+            "elapsed_millis": self.memory_diagnostics.elapsed_millis(),
+            "observed_unix_millis": observed_unix_millis,
+            "column_families": column_families,
+            "database": database,
+            "row_cache": row_cache,
+            "scope": "non-atomic native properties; memory/cache/pending-compaction sizes in bytes, other named properties in counts/flags/seconds; pinned values are subsets; no forced flush/compaction; WAL/SST bytes require directory sampling",
+        })
+    }
+
+    fn emit_memory_sample(&self, phase: &str) {
+        use std::io::Write;
+        let sample = self.memory_sample(phase);
+        // Keep the prefix and JSON together across concurrent Env instances.
+        // Logging errors must not turn an otherwise valid transaction into a
+        // failure. No sampled value affects storage or admission decisions.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "WOK_ROCKSDB_MEMORY_SAMPLE {sample}"
         );
     }
 }
+
+#[cfg(any(
+    feature = "rocksdb-read-diagnostics",
+    feature = "rocksdb-memory-diagnostics"
+))]
+impl Drop for EnvInner {
+    fn drop(&mut self) {
+        #[cfg(feature = "rocksdb-memory-diagnostics")]
+        self.emit_memory_sample("before_native_drop");
+        #[cfg(feature = "rocksdb-read-diagnostics")]
+        {
+            // Observe, never force flush/compaction. This happens after relay threads
+            // join and before RocksDB's own destructor; final child rusage captures
+            // subsequent shutdown I/O as well.
+            let mut cf_stats = serde_json::Map::new();
+            for name in physical_cf_names() {
+                let Some(cf) = self.db.cf_handle(name) else {
+                    continue;
+                };
+                let properties = [
+                    "rocksdb.background-errors",
+                    "rocksdb.estimate-pending-compaction-bytes",
+                    "rocksdb.compaction-pending",
+                    "rocksdb.mem-table-flush-pending",
+                    "rocksdb.estimate-table-readers-mem",
+                    "rocksdb.cur-size-all-mem-tables",
+                    "rocksdb.block-cache-usage",
+                ];
+                let values = properties
+                    .into_iter()
+                    .map(|key| {
+                        (
+                            key.to_string(),
+                            match self.db.property_int_value_cf(cf, key) {
+                                Ok(Some(n)) => serde_json::json!(n),
+                                Ok(None) => serde_json::Value::Null,
+                                Err(e) => serde_json::json!({"error":e.to_string()}),
+                            },
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                cf_stats.insert(name.to_string(), serde_json::Value::Object(values));
+            }
+            eprintln!(
+                "WOK_ROCKSDB_FINAL_STATS {}",
+                serde_json::json!({"column_families":cf_stats,"policy":"sync WAL per committed application batch; no forced settlement"})
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "rocksdb-memory-diagnostics"))]
+#[path = "memory_diagnostics_tests.rs"]
+mod memory_diagnostics_tests;

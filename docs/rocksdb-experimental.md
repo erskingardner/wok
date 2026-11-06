@@ -107,6 +107,8 @@ The native options use a shared 8-GiB hyper-clock block cache, 2-GiB row cache,
 dynamic levels, up to eight background jobs/four subcompactions, 64-MiB per-family
 write buffers, a 2-GiB total write-buffer target and a 1-GiB WAL target. These are
 configured engine targets, not total process-RSS caps or universal optimums.
+For native allocation observations without changing those targets, see the
+optional memory diagnostic build in [reliability validation](reliability.md).
 Legacy `database.map_size`, `max_readers` and `no_read_ahead` settings do not tune
 RocksDB; the free-disk reserve and application storage quotas still apply.
 

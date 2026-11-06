@@ -37,9 +37,9 @@ def stop(child):
         raise RuntimeError(f"relay exited {child.returncode}")
 
 
-def database_bytes(path):
-    """Sample logical backend bytes; compaction may unlink a listed SST."""
-    total = 0
+def database_footprint(path):
+    """Sample logical backend files; compaction may unlink a listed SST."""
+    sizes = {"wal": 0, "sst": 0, "other": 0}
     if path.is_symlink() or not path.is_dir():
         raise RuntimeError(f"expected a plain database directory: {path}")
     for parent, dirs, files in os.walk(path, followlinks=False):
@@ -54,8 +54,13 @@ def database_bytes(path):
             if stat.S_ISLNK(info.st_mode):
                 raise RuntimeError(f"database symlink outside bounded scratch: {entry}")
             if stat.S_ISREG(info.st_mode):
-                total += info.st_size
-    return total
+                kind = "wal" if entry.suffix == ".log" else "sst" if entry.suffix == ".sst" else "other"
+                sizes[kind] += info.st_size
+    return sizes
+
+
+def database_bytes(path):
+    return sum(database_footprint(path).values())
 
 
 def verify_backend(wok):
@@ -103,14 +108,15 @@ def ready(child, url):
 def sample(pid, root, started):
     status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
     stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    return {"seconds": time.monotonic() - started, "pid": pid,
+    footprint = database_footprint(root / "db")
+    return {"seconds": time.monotonic() - started, "observed_unix_millis": int(time.time() * 1000), "pid": pid,
             "rss_kib": int(status.get("VmRSS", "0 kB").split()[0]),
             "anonymous_kib": int(status.get("RssAnon", "0 kB").split()[0]),
             "cpu_seconds": (int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK"),
-            "threads": int(status["Threads"]), "db_bytes": database_bytes(root / "db")}
+            "threads": int(status["Threads"]), "db_bytes": sum(footprint.values()), "db_file_bytes": footprint}
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wok", type=Path, required=True)
     parser.add_argument("--driver", type=Path, required=True)
@@ -118,9 +124,18 @@ def main():
     parser.add_argument("--seconds", type=int, default=3600)
     parser.add_argument("--seed", type=int, default=4242)
     parser.add_argument("--port", type=int, default=17777)
-    args = parser.parse_args()
+    parser.add_argument("--max-db-mib", type=int, default=512,
+                        help="whole database allowance, including WAL (default: 512 MiB)")
+    args = parser.parse_args(argv)
     if sys.platform != "linux" or not 10 <= args.seconds <= 21600:
         parser.error("requires Linux and a duration between 10 and 21600 seconds")
+    if not 64 <= args.max_db_mib <= 16384:
+        parser.error("--max-db-mib must be between 64 and 16384")
+    return args
+
+
+def main():
+    args = parse_args()
     root = args.out.resolve()
     root.mkdir(parents=True, exist_ok=False)
     # Short socket path avoids AF_UNIX's small sun_path even for deep artifact roots.
@@ -157,6 +172,7 @@ max_pending_outbound_bytes = 16777216
                 "backend": "rocksdb",
                 "durability": "synchronous RocksDB WAL batches",
                 "db_size_scope": "all regular database files, including WAL/SST/metadata; logical bytes",
+                "database_policy": {"max_mib": args.max_db_mib},
                 "crash_scope": "one intentional SIGKILL after an acknowledged batch; not in-flight writes or power loss",
                 "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "memory_policy": {"rss_max_mib": 768, "anonymous_growth_max_mib_after_120s_warmup": 64}}
@@ -232,8 +248,8 @@ max_pending_outbound_bytes = 16777216
                     log.flush()
                     if row["rss_kib"] > 768 * 1024:
                         raise RuntimeError("relay exceeded the 768 MiB RSS budget")
-                    if row["db_bytes"] > 512 * 1024 * 1024:
-                        raise RuntimeError("bounded dataset exceeded 512 MiB database budget")
+                    if row["db_bytes"] > args.max_db_mib * 1024 * 1024:
+                        raise RuntimeError(f"bounded dataset exceeded {args.max_db_mib} MiB database budget")
                     with urllib.request.urlopen(url, timeout=3) as response:
                         metrics.write(json.dumps({"seconds": row["seconds"], "text": response.read().decode()}) + "\n")
                         metrics.flush()
@@ -251,8 +267,13 @@ max_pending_outbound_bytes = 16777216
             if len(warm) >= 12:
                 change = max(s["anonymous_kib"] for s in warm[-6:]) - max(s["anonymous_kib"] for s in warm[:6])
                 growth.append({"pid": pid, "anonymous_growth_kib": change})
-                if change > 64 * 1024:
-                    raise RuntimeError(f"anonymous memory grew by {change} KiB after warmup")
+        (root / "memory-analysis.json").write_text(json.dumps({
+            "policy": metadata["memory_policy"], "segments": growth,
+            "ok": all(segment["anonymous_growth_kib"] <= 64 * 1024 for segment in growth),
+        }, indent=2))
+        for segment in growth:
+            if segment["anonymous_growth_kib"] > 64 * 1024:
+                raise RuntimeError(f"anonymous memory grew by {segment['anonymous_growth_kib']} KiB after warmup")
         driver = json.loads((root / "driver-result.json").read_text())
         validate_driver_result(driver)
         if final_audit["events"] != driver["stored"]:

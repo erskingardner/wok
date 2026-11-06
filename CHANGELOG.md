@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wok backup --output <new-directory>` creates a native RocksDB checkpoint
   without replacing a path. Operator guidance covers migration, verification,
   source preservation and rollback limits after new writes.
+- Optional `wok-db/rocksdb-memory-diagnostics` builds report native allocation
+  usage without changing storage settings. The soak runner records an explicit
+  `--max-db-mib` allowance while retaining its memory and recovery checks.
 - NIP-D9 Deletion Request Protection from NIPs proposal #2531: eligible
   events signed with `["no_delete"]` survive their author's kind-5 deletion
   and kind-62 purge requests, regardless of arrival order or republication.

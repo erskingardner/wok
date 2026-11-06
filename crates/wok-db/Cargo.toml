@@ -11,6 +11,8 @@ description = "Wok RocksDB storage and verified read-only LMDB migration"
 op-log = []
 # Opt-in, synchronous read diagnostics. No hooks are compiled into ordinary builds.
 rocksdb-read-diagnostics = []
+# Opt-in native memory observations; no sampling hooks in ordinary builds.
+rocksdb-memory-diagnostics = []
 
 [dependencies]
 rustix = { version = "1", features = ["fs"] }

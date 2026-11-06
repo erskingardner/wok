@@ -139,8 +139,12 @@ replay stream, so a seed alone does not reproduce every event byte.
 Database size counts all regular files below the owned database directory,
 including RocksDB WAL/SST files. Paths containing
 symlinks are rejected; a file removed by compaction during a sample is skipped.
-These directory samples are not atomic storage snapshots. Sampled budgets are 768 MiB relay RSS and 512 MiB
-database size. Five-second
+These directory samples are not atomic storage snapshots. Default sampled budgets
+are 768 MiB relay RSS and 512 MiB database size. `--max-db-mib` records an explicit
+whole-database allowance in the manifest; for example, `--max-db-mib 2048` leaves
+room above the current native 1-GiB WAL flush target. It changes no engine option,
+arrival rate or memory check. Preserve failed runs when comparing allowances.
+Five-second
 sampling can miss shorter resource spikes; these are not continuous peak measurements. For each process lifetime,
 after 120 seconds of warmup, growth between the first and last six anonymous-RSS
 samples must remain within 64 MiB. Short canaries may have no eligible growth
@@ -157,6 +161,16 @@ Normal synchronous RocksDB WAL batches are retained.
 These are workload budgets, not the storage engines' production memory limits.
 The resource cap does not cover
 the load driver's memory; container limits and host details are recorded.
+
+For a separate allocation diagnosis, build the relay with
+`--features wok-db/rocksdb-memory-diagnostics`. It logs native per-family
+memtable/table-reader sizes, snapshots, the shared block cache once and row-cache
+usage at transaction boundaries, at most once per 15 seconds per environment,
+plus a final sample before native shutdown. Samples include process, path and
+read-only identity; offline audits are different processes from the live relay.
+The properties are non-atomic observations; pinned sizes are subsets. This
+feature forces no flush or compaction and is absent from ordinary builds.
+Keep instrumented diagnosis separate from comparative latency results.
 
 This workload checks periodic sync during continuing relay operation. It does
 not establish behavior for every large private sync, sustained saturation,

@@ -14,6 +14,15 @@ spec.loader.exec_module(soak)
 
 
 class DatabaseBudget(unittest.TestCase):
+    def test_explicit_disk_allowance_is_bounded_and_default_is_unchanged(self):
+        required = ["--wok", "/unused/wok", "--driver", "/unused/driver", "--out", "/unused/out"]
+        with patch.object(soak.sys, "platform", "linux"):
+            self.assertEqual(soak.parse_args(required).max_db_mib, 512)
+            self.assertEqual(soak.parse_args(required + ["--max-db-mib", "2048"]).max_db_mib, 2048)
+            for value in ["0", "-1", "63", "16385"]:
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    soak.parse_args(required + ["--max-db-mib", value])
+
     def test_whole_rocks_directory_includes_wal_sst_and_nested_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -21,6 +30,7 @@ class DatabaseBudget(unittest.TestCase):
             for name, size in [("CURRENT", 8), ("000001.sst", 101), ("wal/000002.log", 37)]:
                 (root / name).write_bytes(b"x" * size)
             self.assertEqual(soak.database_bytes(root), 146)
+            self.assertEqual(soak.database_footprint(root), {"wal": 37, "sst": 101, "other": 8})
 
     def test_size_includes_metadata_and_lock_files(self):
         with tempfile.TemporaryDirectory() as tmp:

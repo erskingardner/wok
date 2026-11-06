@@ -22,6 +22,14 @@ select a build backend. Reproducing an older LMDB comparison requires its exact
 preserved binary/source; an ordinary current build cannot produce an LMDB relay.
 This documentation update does not relabel or regenerate old campaign evidence.
 
+Supply a current release build through `--wok-binary` and omit
+`--rocksdb-binary`. The historical fourth arm requires full-cover seed audits
+and shutdown statistics from its older layout; current thin-frontier storage
+does not satisfy that contract. Arm names identify campaign entries; record the
+actual binary, source and `wok storage-backend` separately. For an ordinary
+`wok` run without native shutdown statistics, the audit reports
+`background_errors: null`, meaning the counter was unavailable.
+
 The driver exposes `--scenario matched_network_generate` and
 `--scenario matched_network`; `target/release/wok-bench --help` lists their shared
 options. `python3 tools/relay-matched/run-campaign.py --help` describes the
@@ -69,7 +77,7 @@ Audit completed trial directories on the host that holds their raw ledgers:
 
 ```sh
 python3 tools/relay-matched/audit-timestamps.py \
-  /path/to/campaign/main/reports/r1-w1000-rocksdb \
+  /path/to/campaign/main/reports/r1-w1000-wok \
   /path/to/campaign/main/reports/r1-w1000-strfry \
   --window-seconds 5 --out /path/to/new-audit.json
 ```
@@ -93,6 +101,9 @@ Read-queue overflow classification is opt-in and requires external relay-side
 proof plus successful write/body checks. It retains the original protocol errors
 and incomplete read counts. Such a cell is ineligible for both read and write
 mixed-load rankings because early read disconnections change later contention.
+This recovery option uses the historical fourth arm's full-cover and native
+statistics contract. Ordinary `wok` cells with incomplete reads or writes cannot
+win a mixed-load comparison.
 Stock fastr buffered acknowledgements must also remain distinguished from
 RocksDB synchronous WAL acknowledgements and, in archived comparisons, synchronous
 LMDB commits.

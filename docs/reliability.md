@@ -8,7 +8,7 @@ or production capacity.
 
 | Workflow | Evidence |
 | --- | --- |
-| `ci.yml` | Formatting, Clippy, all workspace tests (including benchmark correctness), Rust 1.85 compilation |
+| `ci.yml` | Formatting, Clippy, both-backend workspace tests (including benchmark correctness), Rust 1.85 LMDB and Rust 1.88 RocksDB compilation |
 | `ci.yml` migration job | Builds pinned strfry `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`; verifies import, event identity, and actual CLI migration |
 | `platforms.yml` | Native release build, version check, storage/transport/compatibility/CLI tests on Linux x86-64/ARM64 and macOS Intel/Apple Silicon |
 | `fuzz.yml` | 10,000 AddressSanitizer ingress fuzz iterations, protocol-shaped seeds, 2 MiB input ceiling, corpus reuse, crash artifacts |
@@ -35,6 +35,11 @@ semaphores on macOS" in `production-deployment.md`.
 The GitHub ruleset is separate from workflow configuration. Defining mandatory
 jobs within a workflow does not make passing checks a prerequisite for pushing
 to master. Branch-rule changes require a separate repository-policy decision.
+
+Native functional test jobs use `RUST_TEST_THREADS=2` to bound concurrent
+database fixtures and their open files, particularly RocksDB's column-family
+fixtures. This is test resource control, not a runtime capacity claim; soak and
+benchmark arrival rates and production file-descriptor settings are unchanged.
 
 ## Generated lifecycle tests
 

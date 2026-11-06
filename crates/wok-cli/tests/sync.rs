@@ -93,6 +93,9 @@ impl Drop for Server {
     }
 }
 async fn serve(config: &Path) -> Server {
+    serve_with_env(config).await.0
+}
+async fn serve_with_env(config: &Path) -> (Server, wok_db::Env) {
     let mut cfg = Config::load(config).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -106,12 +109,12 @@ async fn serve(config: &Path) -> Server {
     )
     .unwrap();
     env.ensure_initialized().unwrap();
-    let handle = wok_relay::start(env, cfg).unwrap();
+    let handle = wok_relay::start(env.clone(), cfg).unwrap();
     let h = handle.clone();
     let task = tokio::spawn(async move {
         wok_ws::serve_listener(h, listener).await.unwrap();
     });
-    Server { handle, task, url }
+    (Server { handle, task, url }, env)
 }
 fn summary(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
@@ -749,6 +752,10 @@ impl Drop for KillOnDrop {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_events_from_import_sync_and_router_are_neither_stored_nor_delivered() {
+    if wok_db::storage_backend_name().starts_with("rocksdb") {
+        auth_events_from_stopped_writers_are_neither_stored_nor_delivered().await;
+        return;
+    }
     // NIP-42: relays MUST exclude kind 22242 from broadcast. These writers
     // skip EVENT ingest, and the relay delivers their commits to live
     // subscribers through its DB-change monitor.
@@ -845,6 +852,178 @@ async fn auth_events_from_import_sync_and_router_are_neither_stored_nor_delivere
         })
         .collect();
     assert_eq!(kinds, [1, 1, 1]);
+}
+
+/// RocksDB has one owning writer process. Exercise the actual CLI policies
+/// while the relay is stopped, then check history and same-process live
+/// maintenance commits; do not turn a second-process lock refusal into an AUTH
+/// policy result. The original LMDB multi-process/live-watch path stays above.
+async fn auth_events_from_stopped_writers_are_neither_stored_nor_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(
+        dir.path(),
+        "[events]\nephemeral_persistence=\"ttl\"\n[relay.auth]\nenabled=false\n",
+    );
+    let feed = |url: &str| {
+        let auth = sign(
+            json!({"kind":22242,"created_at":now()-2,
+                "tags":[["relay",url],["challenge","replayed"]],"content":""}),
+            &key(),
+        );
+        (auth, event(1))
+    };
+    let mut markers = Vec::new();
+
+    let (auth, marker) = feed("ws://127.0.0.1/");
+    let output = import_output(&cfg, &[auth, marker.clone()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("kind 22242 AUTH events are never stored"),
+        "{stderr}"
+    );
+    markers.push(marker);
+
+    let (auth, marker) = feed("ws://127.0.0.1/");
+    let (url, peer) = serving_peer(vec![auth, marker.clone()]).await;
+    let output = sync(&cfg, &url, &["--dir", "down", "--json"]);
+    assert!(!output.status.success());
+    let report = summary(&output);
+    assert_eq!(
+        (report["written"].as_u64(), report["rejected"].as_u64()),
+        (Some(1), Some(1))
+    );
+    peer.await.unwrap();
+    markers.push(marker);
+
+    let (auth, marker) = feed("ws://127.0.0.1/");
+    let (url, peer) = serving_peer(vec![auth, marker.clone()]).await;
+    let routes = dir.path().join("router.conf");
+    std::fs::write(
+        &routes,
+        format!("streams {{\n  peer {{\n    dir = \"down\"\n    urls = [\"{url}\"]\n  }}\n}}\n"),
+    )
+    .unwrap();
+    let mut router = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_wok"))
+            .arg("--config")
+            .arg(&cfg)
+            .arg("router")
+            .arg(&routes)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = router.0.stderr.take().unwrap();
+    // The router emits this message only after committing its accepted batch.
+    // Wait for it without opening the database while that process owns it.
+    let committed = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let mut refused = false;
+        let mut logs = Vec::new();
+        for line in std::io::BufReader::new(stderr).lines().take(64) {
+            let line = line.unwrap();
+            refused |= line.contains("kind 22242 AUTH events are never stored");
+            let wrote = line.contains("router: wrote 1 events");
+            logs.push(line);
+            if wrote {
+                return (refused, true, logs);
+            }
+        }
+        (refused, false, logs)
+    });
+    let (refused, wrote, logs) = tokio::time::timeout(Duration::from_secs(10), committed)
+        .await
+        .expect("router did not commit fixture events")
+        .unwrap();
+    assert!(refused && wrote, "{logs:?}");
+    drop(router); // kill AND reap before another owner opens the database
+    peer.await.unwrap();
+    markers.push(marker);
+
+    let exported = cli(&cfg, &["export"]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let stored = printed_events(&exported);
+    assert_eq!(
+        stored
+            .iter()
+            .map(|e| e["kind"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 1, 1]
+    );
+    assert_eq!(stored.len(), markers.len());
+    assert!(markers.iter().all(|marker| stored.contains(marker)));
+
+    let (server, env) = serve_with_env(&cfg).await;
+    let (mut by_kind, _) = tokio_tungstenite::connect_async(&server.url).await.unwrap();
+    subscribe(&mut by_kind, "auth", json!({"kinds":[22242]})).await;
+    auth_fixture_history(&mut by_kind, "marker", json!({"kinds":[1]}), &markers).await;
+    let (mut everything, _) = tokio_tungstenite::connect_async(&server.url).await.unwrap();
+    auth_fixture_history(&mut everything, "everything", json!({}), &markers).await;
+
+    // A legacy/raw maintenance writer can bypass the CLI refusal. Keep the
+    // original live-delivery proof by committing AUTH before its marker through
+    // the relay's SAME Env, with one owning process and the ordinary DB watcher.
+    let (auth, marker) = feed(&server.url);
+    let mut events: Vec<_> = [auth, marker.clone()]
+        .iter()
+        .map(|value| {
+            let parsed = wok_event::parse_and_verify_event(
+                value,
+                &wok_event::EventLimits::default(),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            wok_db::EventToWrite::new(parsed.packed.into_bytes(), parsed.json)
+        })
+        .collect();
+    {
+        let mut txn = env.begin_rw().unwrap();
+        wok_db::write_events(&mut txn, &mut wok_db::NoopNegentropy, &mut events, false).unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(events
+        .iter()
+        .all(|event| event.status == wok_db::EventWriteStatus::Written));
+    assert_eq!(recv(&mut by_kind).await, json!(["EVENT", "marker", marker]));
+    assert_eq!(
+        recv(&mut everything).await,
+        json!(["EVENT", "everything", marker])
+    );
+    server
+        .handle
+        .shutdown_and_join(Duration::from_secs(10))
+        .unwrap();
+}
+
+async fn auth_fixture_history(ws: &mut Client, sub: &str, filter: Value, markers: &[Value]) {
+    ws.send(Message::Text(
+        json!(["REQ", sub, filter]).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let mut remaining = markers.to_vec();
+    for _ in 0..markers.len() {
+        let message = recv(ws).await;
+        assert_eq!(message[0], "EVENT", "{message}");
+        assert_eq!(message[1], sub, "{message}");
+        let index = remaining
+            .iter()
+            .position(|event| *event == message[2])
+            .unwrap_or_else(|| panic!("unexpected or repeated history event: {message}"));
+        remaining.swap_remove(index);
+    }
+    let eose = recv(ws).await;
+    assert!(eose[0] == "EOSE" && eose[1] == sub, "{eose}");
+    assert!(remaining.is_empty());
 }
 
 #[test]

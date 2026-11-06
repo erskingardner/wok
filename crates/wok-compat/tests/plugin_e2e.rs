@@ -127,8 +127,11 @@ async fn whitelist_js_accepts_whitelisted_and_rejects_others() {
     let friend = Keypair::new(SECP256K1, &mut rng);
     let (friend_xonly, _) = friend.x_only_public_key();
     let plugin = write_whitelist_plugin(dir.path(), &hex::encode(friend_xonly.serialize()));
-    let cfg = test_cfg(dir.path(), plugin.to_string_lossy().into_owned());
-    let (handle, addr) = start(dir.path(), cfg).await;
+    // The executable fixture is not a database member. Keep the backend's
+    // fresh-directory/layout checks independent of the plugin under test.
+    let database = dir.path().join("db");
+    let cfg = test_cfg(&database, plugin.to_string_lossy().into_owned());
+    let (handle, addr) = start(&database, cfg).await;
 
     // Whitelisted pubkey -> accept.
     let ev = sign_event_with_key(
@@ -150,5 +153,5 @@ async fn whitelist_js_accepts_whitelisted_and_rejects_others() {
         verdict.contains("false") && verdict.contains("blocked: not on white-list"),
         "stranger not rejected by plugin: {verdict}"
     );
-    handle.request_shutdown();
+    handle.shutdown_and_join(Duration::from_secs(10)).unwrap();
 }

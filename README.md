@@ -170,20 +170,44 @@ per stage (`numThreads.*`) with connections hashed onto workers like C++
 
 ## Benchmarks
 
-Harness: `wok-bench` uses disposable databases, deterministic signed corpora,
-rotated relay order, and correctness gates before speed. Local process
-comparisons, two-host load campaigns, and same-host Unix/WebSocket comparisons
-are separate experiments so network RTT is not confused with transport cost.
+We compared **Wok's optimized RocksDB candidate** with **strfry 1.1.3** over
+WebSocket on separate relay/load hosts with identical 15-million-event signed
+histories. Runs offered 1,000 queries/second alongside 1,000 or 4,000
+writes/second. Queries covered exact IDs, author history, 500-author feeds and
+tags. Each rate was repeated with reversed relay order: ten minutes at 1,000
+writes/second and five at 4,000. Checks verified bodies, ordering, completion
+and readback of every accepted write.
 
-Reproduce:
+| Measurement | Wok RocksDB | strfry |
+| --- | ---: | ---: |
+| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms |
+| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms |
+| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms |
+| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms |
+
+Latency runs from scheduled arrival to EOSE/acknowledgement, including client
+and network delay. Ranges span individual trial percentiles without pooling.
+Wok reduced read p99 by **34–61% in all 16 matched cases**, with a worse rare
+read tail in one run. Finite, prewarmed runs do not establish maximum capacity
+or equal power-loss durability. Writers used different authors from the queries.
+A separate ten-minute correctness run covered writes to queried authors, live
+delivery, restart and forced-crash recovery.
+
+Results describe the measured RocksDB experiment at
+[`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8),
+not the default LMDB build. [Evidence and limits](https://github.com/erskingardner/wok/pull/294)
+· [Matched campaign instructions](tools/relay-matched/README.md).
+
+For a smaller local comparison with the RocksDB candidate:
 
 ```bash
-cargo build --release -p wok-cli -p wok-bench
+cargo build --release --locked -p wok-cli -p wok-bench --features wok-cli/rocksdb
 ./target/release/wok-bench --profile full --out bench-results \
   --strfry /path/to/strfry --wok ./target/release/wok --seed 1
 ```
 
-Details and methodology: [docs/benchmarks.md](docs/benchmarks.md).
+Build requirements and full-state upgrades: [RocksDB migration guide](docs/migration-to-rocksdb.md).
+Harness and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 NIP-50 design, semantics, and search workload: [docs/nip50-search.md](docs/nip50-search.md).
 
 ## Differences from strfry

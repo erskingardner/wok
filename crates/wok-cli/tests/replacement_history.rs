@@ -3,6 +3,31 @@ mod replacement;
 use serde_json::Value;
 use std::process::Command;
 
+fn persistent_bytes(
+    database: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    if cfg!(feature = "rocksdb-backend") {
+        std::fs::read_dir(database)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                assert!(path.is_file());
+                (
+                    path.file_name().unwrap().into(),
+                    std::fs::read(&path).unwrap(),
+                )
+            })
+            .collect()
+    } else {
+        // Registered LMDB readers may update lock.mdb bookkeeping.
+        [(
+            std::path::PathBuf::from("data.mdb"),
+            std::fs::read(database.join("data.mdb")).unwrap(),
+        )]
+        .into()
+    }
+}
+
 #[test]
 fn doctor_and_migration_report_history_while_preserving_lossless_records() {
     let dir = tempfile::tempdir().unwrap();
@@ -43,6 +68,11 @@ fn doctor_and_migration_report_history_while_preserving_lossless_records() {
         .unwrap()
         .iter()
         .any(|c| c["name"] == "replacement-history" && c["status"] == "warn"));
+    // The remaining assertions exercise the native strfry LMDB boundary.
+    // RocksDB has its own verified Wok-LMDB conversion suite.
+    if cfg!(feature = "rocksdb-backend") {
+        return;
+    }
     let env = replacement::seed(&source, &events, 3);
     let fingerprint = wok_db::event_fingerprint(&env).unwrap();
     drop(env);
@@ -204,7 +234,7 @@ fn purge_superseded_dry_run_never_writes() {
             .unwrap()
     };
 
-    let before = std::fs::read(db.join("data.mdb")).unwrap();
+    let before = persistent_bytes(&db);
     let output = dry_run(&db);
     assert!(
         output.status.success(),
@@ -214,8 +244,8 @@ fn purge_superseded_dry_run_never_writes() {
     let outcome: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(outcome["superseded_events"], 2);
     assert!(
-        std::fs::read(db.join("data.mdb")).unwrap() == before,
-        "dry run changed data.mdb"
+        persistent_bytes(&db) == before,
+        "dry run changed persistent database files"
     );
 
     let missing = dir.path().join("missing");

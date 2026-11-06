@@ -263,7 +263,16 @@ impl Env {
             // maintenance, the directory must not be replaced during open.
             check_existing_layout(path)?;
         }
-        let (options, cfs) = native_options(fresh, physical_cf_names());
+        let (mut options, cfs) = native_options(fresh, physical_cf_names());
+        if opts.read_only {
+            // Read-only maintenance must not rotate LOG or persist open-time
+            // statistics, even though those files are outside the key space.
+            options.set_info_logger(rocksdb::InfoLogger::new_callback_logger(
+                rocksdb::LogLevel::Error,
+                |_, _| {},
+            ));
+            options.set_skip_stats_update_on_db_open(true);
+        }
         let db = if opts.read_only {
             rocksdb::DB::open_cf_descriptors_read_only(&options, path, cfs, false)
         } else {

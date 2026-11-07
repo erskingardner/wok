@@ -1,26 +1,19 @@
-//! JSON parse/serialize matching C++ `tao::json` semantics.
+//! Strict JSON parsing and deterministic event serialization.
 //!
-//! Differences from stock `serde_json` that matter for wire and storage
-//! compatibility with strfry:
+//! `parse_strict` rejects duplicate object keys. Stored JSON uses sorted
+//! object keys, no whitespace, UTF-8 passthrough and shortest-round-trip ryu
+//! float formatting. `to_tao_string` escapes control characters below U+0020
+//! and U+007F, preserving the stored payload encoding used by migration.
 //!
-//! - `parse_strict` rejects duplicate object keys (`tao::json::from_string`
-//!   throws `duplicate JSON object key`); serde_json silently keeps the last.
-//! - `to_tao_string` escapes U+007F as `\u007f` (tao escapes all control
-//!   characters `< 0x20` *and* `0x7F`); serde_json emits `0x7F` raw.
-//! - Both sides otherwise agree: sorted object keys, no whitespace, UTF-8
-//!   passthrough, shortest-round-trip ryu float formatting.
-//!
-//! The normalized stored JSON must match the C++ byte output exactly, so
-//! always use `to_tao_string` for it. The NIP-01 event id preimage is written
-//! by `write_nip01`, which differs only in writing U+007F verbatim.
+//! Always use `to_tao_string` for normalized stored JSON. `write_nip01`
+//! writes the NIP-01 event id preimage with U+007F verbatim.
 
 use serde_json::{Map, Value};
 
 use crate::EventError;
 
-/// Maximum nesting depth accepted by the parser. Matches serde_json's
-/// default recursion limit (128). C++ tao has no built-in limit; wok keeps
-/// the cap as DoS hardening (documented in docs/known-differences.md).
+/// Maximum nesting depth accepted by the parser, bounded to limit
+/// denial-of-service exposure from deeply nested input.
 const MAX_DEPTH: usize = 128;
 
 pub fn parse_strict(text: &str) -> Result<Value, EventError> {

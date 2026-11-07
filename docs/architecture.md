@@ -65,9 +65,9 @@ counted again rather than abort its transaction (`wok_author_count_drift_total`)
 
 Events are stored in `Event` (PackedEvent) and `EventPayload` (JSON), keyed
 by a local ID that the writer allocates and never reuses. Every other event
-table is derived from them and rebuilt by `wok reindex`: strfry's indexes by
+table is derived from them and rebuilt by `wok reindex`: indexes by
 id, pubkey, kind, pubkey and kind, single-letter tag, `created_at`,
-expiration, replacement address and deletion, then Wok's NIP-50 search
+expiration, replacement address and deletion, plus NIP-50 search
 postings and `(tag, kind, created_at)` postings. All but the search postings
 are written in the transaction that inserts the event (`(tag, kind,
 created_at)` postings only while that index is on) and removed in the one
@@ -201,7 +201,7 @@ a REQ reusing an open id is charged only for the difference.
    monitor sends EOSE, with the history's hints, then the held matches in
    arrival order, then delivers live. NIP-01 defines EOSE as the boundary to "events newly received in
    real-time", so everything held follows it, including stored events
-   committed during the scan (strfry sends those first). Held events are
+   committed during the scan. Held events are
    checked against the read policy again before they are sent.
    - Stored events after the snapshot that the buffer lacks are re-read from
      RocksDB after EOSE. That happens when the monitor matched commits past the

@@ -141,7 +141,7 @@ a detached task that never ends) or keep its own `Env` clone past shutdown.
 ## Write-policy plugins
 
 The write-policy command is trusted operator configuration and currently runs
-through `sh -c` for strfry migration compatibility. Event JSON is sent on the
+through `sh -c`. Event JSON is sent on the
 child's standard input and is never interpolated into that command, but the
 child still runs as the `wok` user inside the relay's systemd sandbox.
 
@@ -174,8 +174,6 @@ authenticated as their author and checks before the plugin runs. It is absent
 for every other event, even from a connection that authenticated, so it does
 not tell a plugin who is logged in: a deny-list keyed on it would let every
 other event through. Decide on `event.pubkey`, which the signature proves.
-strfry's plugin documentation says `authed` is present whenever the connection
-authenticated, but pinned strfry also sets it only for protected events.
 
 A `reject` record's `msg` becomes the OK reason the client sees. Start it with
 a NIP-01 prefix such as `blocked:` or `rate-limited:`. Wok sends any other

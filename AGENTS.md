@@ -1,6 +1,6 @@
 # Wok
 
-Rust Nostr relay that began as a reimplementation of [strfry](https://github.com/hoytech/strfry). RocksDB is the sole runtime. Wok LMDB v4/v5 and strfry v3 are read-only, one-way migration sources. Runtime databases are Wok-owned (v5 logical marker) and protocol behavior follows pinned NIPs, not every strfry quirk.
+Rust Nostr relay with RocksDB as its sole runtime. Wok LMDB v4/v5 and strfry v3 are read-only, one-way migration sources. Runtime databases are Wok-owned (v5 logical marker) and protocol behavior follows pinned NIPs.
 
 License: AGPL-3.0-or-later. Workspace version lives in the root `Cargo.toml`. MSRV is 1.88 (`rust-toolchain.toml` pins a newer stable for local builds).
 
@@ -50,7 +50,7 @@ clients ─Unix─► wok-unix─┼─► wok-relay (crossbeam) ─► dedicate
 - Advertise only NIPs with observable relay behavior and conformance coverage (`wok-relay` capabilities catalog).
 - Safe crates `forbid(unsafe_code)`. Native storage/OS FFI is isolated and documented (`wok-db` migration helpers, `wok-cli` doctor/migrate, `wok-relay` rlimit).
 
-Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` → lossless migration / event identity → pinned strfry as historical/differential reference.
+Source-of-truth order: pinned NIPs → explicit Wok decisions in `docs/` → lossless migration / event identity.
 
 ## Commands
 
@@ -73,7 +73,7 @@ cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 
 - This directory's crate map: `crates/AGENTS.md`
 - Architecture: `docs/architecture.md` and `docs/AGENTS.md`
-- Compatibility: `docs/compatibility-policy.md`, `docs/known-differences.md`
+- Migration: `docs/migration-from-strfry.md`, `docs/migration-to-rocksdb.md`
 - NIPs: `docs/nips.md` (pin: `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`)
 - Config sample: `docs/wok.toml`
 - Non-goals: `docs/architecture.md`

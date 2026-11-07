@@ -8,8 +8,7 @@
 //!   whole.
 //! - [`Corpus::expected`] answers a filter as NIP-01 does, newest first. Where
 //!   a `limit` cuts through one second, any of that second's events may fill
-//!   the reply: strfry and Wok send a second's events in arrival order, not
-//!   lowest id first (`docs/known-differences.md`).
+//!   the reply, accommodating Wok's arrival ordering within a second.
 //! - [`Corpus::filters`] is the `ws_query_latency` plan. A social corpus gets
 //!   the archive reads of #226 scenario B; the other mixes keep the shapes
 //!   earlier campaigns measured.
@@ -20,9 +19,8 @@
 //! couple of hundred bytes an event rather than the event, so #226's
 //! 50M-event tier fits a load host.
 //!
-//! No plan reads a kind that Wok serves only to its authenticated recipient
-//! ([`RECIPIENT_ONLY`]) and strfry serves to anyone, and every filter has a
-//! `limit` of at most 500, strfry's and Wok 0.7's `maxFilterLimit`.
+//! Read plans omit recipient-only kinds that require authentication
+//! ([`RECIPIENT_ONLY`]) and use a filter `limit` of at most 500.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;

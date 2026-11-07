@@ -12,6 +12,7 @@ it, the gate in front of it, and the work done before that gate.
 - Treat every EVENT as untrusted. IDs and Schnorr signatures are verified unless `--no-verify` import is explicitly used. `wok migrate strfry` verifies every event it copies against its stored payload.
 - Input limits: `max_event_size`, tag counts, WebSocket/Unix frame sizes, and
   `max_pending_outbound_bytes`.
+- Event JSON rejects duplicate object keys and nesting deeper than 128 levels.
 - Unix sockets: bound at a sibling temp path, chmod/chowned there, and
   atomically renamed into place (no bind→chmod window); stale-path replacement
   refuses symlinks and non-sockets; shutdown unlinks only after re-verifying

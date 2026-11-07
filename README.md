@@ -177,9 +177,9 @@ per stage (`numThreads.*`) with connections hashed onto workers like C++
 ## Benchmarks
 
 We compared **Wok's optimized RocksDB candidate** with **strfry 1.1.3** over
-WebSocket on separate relay/load hosts with identical 15-million-event signed
-histories. Runs offered 1,000 queries/second alongside 1,000 or 4,000
-writes/second. Queries covered exact IDs, author history, 500-author feeds and
+WebSocket on separate relay/load hosts with identical generated histories of
+15 million signed events. Runs offered 1,000 queries/second alongside 1,000 or
+4,000 writes/second. Queries covered exact IDs, author history, 500-author feeds and
 tags. Each rate was repeated with reversed relay order: ten minutes at 1,000
 writes/second and five at 4,000. Checks verified bodies, ordering, completion
 and readback of every accepted write.
@@ -188,12 +188,18 @@ Four later **fastr** runs covered the same workload and 16 query cases. fastr
 used buffered write acknowledgments without an fsync barrier; its write latency
 has a different durability guarantee.
 
-| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) |
-| --- | ---: | ---: | ---: |
-| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s |
-| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s |
-| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s |
-| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms |
+A later stock **nostr-rs-relay 0.10.0** attempt verified the same history, then
+timed out during the fixed historical-query preflight. It did not reach timed
+read/write tests and is unranked below.
+
+| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) | nostr-rs-relay (later attempt) |
+| --- | ---: | ---: | ---: | ---: |
+| Timed reads completed / offered | 1.8M / 1.8M | 1.8M / 1.8M | 1.8M / 1.8M | Not run |
+| Timed writes accepted / offered | 3.6M / 3.6M | 3.6M / 3.6M | 3.6M / 3.6M | Not run |
+| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s | N/A |
+| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s | N/A |
+| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s | N/A |
+| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms | N/A |
 
 Latency runs from scheduled arrival to EOSE/acknowledgement, including client
 and network delay. Ranges span individual trial percentiles without pooling.
@@ -211,7 +217,9 @@ Results describe the measured RocksDB candidate at
 and fastr at
 [`bdbc0bc`](https://github.com/arx-ccn/fastr/commit/bdbc0bc053ad66df444eb47a02aa468e0109775d),
 before the single-runtime release preparation; they do not measure every later
-release change. [Evidence and limits](https://github.com/erskingardner/wok/pull/294)
+release change. The nostr-rs-relay attempt used
+[`b5c1f64`](https://github.com/scsibug/nostr-rs-relay/commit/b5c1f642e4f4c3b9c54f5d18d66f4c53642076b4).
+[Earlier comparison evidence and limits](https://github.com/erskingardner/wok/pull/294)
 · [Matched campaign instructions](https://github.com/erskingardner/wok/tree/master/tools/relay-matched).
 
 For a smaller local comparison with the current RocksDB runtime:

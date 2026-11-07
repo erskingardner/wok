@@ -178,28 +178,24 @@ per stage (`numThreads.*`) with connections hashed onto workers like C++
 
 We compared **Wok's optimized RocksDB candidate** with **strfry 1.1.3** over
 WebSocket on separate relay/load hosts with identical generated histories of
-15 million signed events. Runs offered 1,000 queries/second alongside 1,000 or
-4,000 writes/second. Queries covered exact IDs, author history, 500-author feeds and
-tags. Each rate was repeated with reversed relay order: ten minutes at 1,000
-writes/second and five at 4,000. Checks verified bodies, ordering, completion
-and readback of every accepted write.
+15 million signed events of kinds 1 and 7. Runs offered 1,000 queries/second
+alongside 1,000 or 4,000 writes/second. Queries covered exact IDs, author history,
+500-author feeds and tags. Each rate was repeated with reversed relay order:
+ten minutes at 1,000 writes/second and five at 4,000. Checks verified bodies,
+ordering, completion and readback of every accepted write.
 
 Four later **fastr** runs covered the same workload and 16 query cases. fastr
 used buffered write acknowledgments without an fsync barrier; its write latency
 has a different durability guarantee.
 
-A later stock **nostr-rs-relay 0.10.0** attempt verified the same history, then
-timed out during the fixed historical-query preflight. It did not reach timed
-read/write tests and is unranked below.
-
-| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) | nostr-rs-relay (later attempt) |
-| --- | ---: | ---: | ---: | ---: |
-| Timed reads completed / offered | 1.8M / 1.8M | 1.8M / 1.8M | 1.8M / 1.8M | Not run |
-| Timed writes accepted / offered | 3.6M / 3.6M | 3.6M / 3.6M | 3.6M / 3.6M | Not run |
-| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s | N/A |
-| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s | N/A |
-| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s | N/A |
-| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms | N/A |
+| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) |
+| --- | ---: | ---: | ---: |
+| Timed reads completed / offered | 1.8M / 1.8M | 1.8M / 1.8M | 1.8M / 1.8M |
+| Timed writes accepted / offered | 3.6M / 3.6M | 3.6M / 3.6M | 3.6M / 3.6M |
+| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s |
+| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s |
+| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s |
+| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms |
 
 Latency runs from scheduled arrival to EOSE/acknowledgement, including client
 and network delay. Ranges span individual trial percentiles without pooling.
@@ -212,13 +208,25 @@ A separate one-hour correctness soak checked 500-author latest feeds between
 write batches, live delivery, restart and acknowledged-write
 process-crash recovery.
 
+Later attempts stopped before timed tests and remain unranked:
+
+| Relay | Corpus offered | Qualification outcome |
+| --- | ---: | --- |
+| nostr-rs-relay 0.10.0 | 15 million events | Stored history verified; historical-query preflight exceeded 120 seconds. |
+| Nostream 3.14.0 (native) | First 12,000 events | Importer reported 10,800 inserted and 1,200 errors. |
+
+Sampled Nostream errors rejected reactions without target tags (`e`/`a`), which
+the synthetic kind-7 events lack.
+
 Results describe the measured RocksDB candidate at
 [`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8)
 and fastr at
 [`bdbc0bc`](https://github.com/arx-ccn/fastr/commit/bdbc0bc053ad66df444eb47a02aa468e0109775d),
 before the single-runtime release preparation; they do not measure every later
-release change. The nostr-rs-relay attempt used
-[`b5c1f64`](https://github.com/scsibug/nostr-rs-relay/commit/b5c1f642e4f4c3b9c54f5d18d66f4c53642076b4).
+release change. The later attempts used nostr-rs-relay
+[`b5c1f64`](https://github.com/scsibug/nostr-rs-relay/commit/b5c1f642e4f4c3b9c54f5d18d66f4c53642076b4)
+and Nostream
+[`44f2e7b`](https://github.com/Cameri/nostream/commit/44f2e7b1cbc1c47acd469bdb62ad49713f16d552).
 [Earlier comparison evidence and limits](https://github.com/erskingardner/wok/pull/294)
 · [Matched campaign instructions](https://github.com/erskingardner/wok/tree/master/tools/relay-matched).
 

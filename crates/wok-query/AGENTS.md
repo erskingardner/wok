@@ -12,6 +12,6 @@ This crate reads PackedEvent and search postings through `wok-db`; it does not o
 
 ## Notes
 
-- ID/author filters are exact 32-byte hex (matches C++ `FilterSetBytes(..., 32, 32)`). Prefixes are invalid.
+- ID/author filters are exact 32-byte hex. Prefixes are invalid.
 - NIP-50 search terms are compiled here but indexed in `wok-db::search`.
 - `QueryScheduler` and `ActiveMonitors` are used by the relay req/monitor threads in `wok-relay`.

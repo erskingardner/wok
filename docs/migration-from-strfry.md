@@ -107,8 +107,7 @@ optional `0x`, and no limit from strfry's config is applied, so an event
 strfry verified and packed fails only if Wok's JSON parser refuses its
 payload, for example for nesting deeper than 128 levels. Conversion also has
 hard byte bounds: 64 MiB per source record and 16 MiB per decoded event JSON.
-Oversized records refuse conversion and are never skipped (see
-[known differences](known-differences.md)).
+Oversized records refuse conversion and are never skipped.
 
 Any event that fails refuses publication. It is not skipped: the migration
 retains an unpublished staging directory instead of publishing a partial copy. The error, like the preflight report, gives the

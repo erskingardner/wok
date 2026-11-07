@@ -124,6 +124,8 @@ up-directions export your local DB to the configured URL. Treat router
 configs and sync/upload targets as trusted input. TLS verification is always
 on and cannot be disabled.
 
+Router and sync client links currently use uncompressed WebSocket messages.
+
 ## One-shot downloads
 
 `wok download <url> [--filter <json>]` sends one REQ and prints each event the

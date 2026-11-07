@@ -36,7 +36,7 @@ cargo test --workspace --locked
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
 ```
 
-Some tests compare Wok with strfry. They need a strfry binary in `STRFRY_BIN`:
+Import and interoperability tests use a strfry binary in `STRFRY_BIN`:
 
 ```bash
 cargo test -p wok-db --test cpp_roundtrip
@@ -98,12 +98,10 @@ CLI or tests.
 When protocol behavior is in question, the order of authority is:
 1. the pinned NIPs (see [docs/nips.md](docs/nips.md));
 2. Wok's own documented decisions in `docs/`;
-3. lossless migration;
-4. strfry's behavior.
+3. lossless migration and event identity.
 
-strfry is a reference point, not a spec. Correcting an inherited strfry quirk
-is welcome, as long as it comes with a test and an entry in
-[docs/known-differences.md](docs/known-differences.md).
+Cover protocol changes with conformance tests and describe their observable
+behavior in [docs/nips.md](docs/nips.md).
 
 ## What a pull request needs
 
@@ -115,7 +113,6 @@ is welcome, as long as it comes with a test and an entry in
   | What changed | Update |
   |---|---|
   | A NIP | [docs/nips.md](docs/nips.md) and the capabilities catalog |
-  | A difference from strfry | [docs/known-differences.md](docs/known-differences.md) |
   | A config key | [docs/config.md](docs/config.md), plus [docs/wok.toml](docs/wok.toml) if most operators must set it |
   | A default | `Preset changes` in [CHANGELOG.md](CHANGELOG.md), and the old value in `PAST_DEFAULTS` (`crates/wok-relay/src/config/history.rs`) so `wok doctor` can flag files that pin it |
   | Something operators will notice | The `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) |

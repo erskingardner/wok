@@ -134,14 +134,13 @@ A `#x` filter matches the values of the event's own tags. `#d:[""]` matches
 events with a `d` tag of that value, and addressable events without a `d`,
 whose address NIP-01 takes to be the empty string. It does not match other
 replaceable or addressable events, though Wok packs an empty `d` into them to
-key replacement; see [known differences](known-differences.md).
+key replacement.
 
 A filter with `limit: 0` returns no stored events. The subscription still gets
 EOSE once its other filters have sent theirs, and stays open for new events.
 
 Stored events are sent newest first. Events with the same `created_at` are
-sent in local arrival order, not lowest id first as NIP-01 suggests; see
-[known differences](known-differences.md).
+sent in local arrival order, rather than the lowest-id order NIP-01 suggests.
 
 EOSE carries NIP-67 hints about a REQ's stored events, those stored when it
 was admitted; later ones follow EOSE as live events. A hint is sent only when

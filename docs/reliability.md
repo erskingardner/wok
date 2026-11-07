@@ -16,11 +16,10 @@ or production capacity.
 | `reachability.yml` | Coverage-instrumented probe of every profile: no phase reaches a relay function its `crates/wok-compat/tests/reachability/` baseline does not list, and no phase that reached functions reaches none |
 | `security.yml` | Dependency advisories, licenses, sources, and dependency policy |
 
-C++ comparisons remain optional locally. Set `WOK_REQUIRE_STRFRY=1` to make a
+strfry-dependent tests remain optional locally. Set `WOK_REQUIRE_STRFRY=1` to make a
 missing reference binary fail; the migration job always does this. A passing
-ordinary workspace run on a machine without strfry does not count as C++
-compatibility evidence. C++ is an import/identity reference, not the authority
-for behavior that intentionally differs from pinned NIPs.
+ordinary workspace run on a machine without strfry does not exercise those
+import and interoperability checks. Protocol conformance follows the pinned NIPs.
 
 Fuzzing is triggered by any crate/fuzz change, dependency manifests/locks, or
 the fuzz workflow. Inputs are seeded at protocol and WebSocket length boundaries

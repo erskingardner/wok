@@ -4,16 +4,11 @@
   <img src="docs/wok.svg" alt="Wok logo" width="160">
 </p>
 
-A Rust Nostr relay that began as a reimplementation of
-[strfry](https://github.com/hoytech/strfry). Wok provides a verified, one-way
-migration from strfry v3 databases and configs, then owns its database and
-evolves against the Nostr specifications rather than preserving every strfry
-quirk. It also provides an additional Unix-domain socket transport.
+A Rust Nostr relay with RocksDB storage, synchronous writes, and WebSocket
+and Unix-domain socket transports. Wok follows the Nostr specifications and
+provides verified, offline migration from existing Wok and strfry databases.
 
 [![ci](https://github.com/erskingardner/wok/actions/workflows/ci.yml/badge.svg)](https://github.com/erskingardner/wok/actions/workflows/ci.yml)
-
-- Reference C++ commit: `9acdaeb1f63919184ece5f2dd67af21f1ed62f1b`
-- NIPs pin used by the conformance suite: `0b5532c0355ab27f447e071a93c09cf3a2b4aad5`
 
 ## Highlights
 
@@ -24,9 +19,8 @@ quirk. It also provides an additional Unix-domain socket transport.
 - **RocksDB storage.** Every build uses the same Wok-owned runtime layout,
   snapshot reads, atomic index updates and synchronous WAL commits. LMDB is
   supported only as a read-only migration source; no writers share a database.
-- **Nostr-first protocol behavior.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
-  CLOSED/AUTH and NEG-* are tested against pinned NIPs. Differential tests are
-  migration and regression evidence, not a promise to retain upstream bugs.
+- **Nostr protocol conformance.** EVENT/REQ/CLOSE/COUNT/EOSE/OK/NOTICE/
+  CLOSED/AUTH and NEG-* are tested against pinned NIPs.
 - **NIP-42 AUTH, NIP-45 COUNT with mergeable HyperLogLog sketches, NIP-50
   ranked content search, NIP-62 restart-safe Request to Vanish, NIP-67 EOSE
   completeness hints, NIP-70 protected events, NIP-59 gift-wrap deletion
@@ -35,9 +29,8 @@ quirk. It also provides an additional Unix-domain socket transport.
   filters**.
 - **Standards-first ephemeral delivery**: ephemeral kinds are live-only by
   default, with an explicit persisted TTL compatibility mode.
-- **permessage-deflate** via an in-house RFC 6455/7692 codec (no Rust WS
-  library offers it); mirrors uWS negotiation as strfry configures it.
-- **Unix `SOCK_STREAM` transport** (wok extension): 4-byte big-endian
+- **permessage-deflate** via an in-house RFC 6455/7692 codec.
+- **Unix `SOCK_STREAM` transport**: 4-byte big-endian
   length-prefixed JSON, same dispatcher as WebSocket.
 - **Mesh tooling**: `router` (multi-connection replication with hot reconfig),
   `sync` (NIP-77 two-phase transfer), `upload`, `download`.
@@ -126,7 +119,7 @@ Available operator commands:
 | `backup --output <new-directory>`, `storage-backend`, `rocksdb-check` | Native checkpoint (relay stopped), runtime identity, offline physical audit |
 | `relay` | WS (+ optional Unix) relay |
 | `import` / `export` | JSONL, `--fried`, `--since/--until/--reverse` |
-| `scan`, `event <levId>`, `info`, `delete`, `monitor`, `integrity` | DB utilities (`event` is a wok addition) |
+| `scan`, `event <levId>`, `info`, `delete`, `monitor`, `integrity` | DB utilities |
 | `config show [--overrides \| --defaults]` | Effective configuration with each value's origin: default, preset, or file line (`--overrides`: only values the file changes from its preset; `--defaults`: every setting with the preset's value) |
 | `config minimize [--dry-run]` | Remove settings that repeat the preset's values, keeping comments and a `.bak` backup (`--dry-run`: print a diff) |
 | `doctor [--json]` | Config, storage, index, payload, negentropy, capacity, and runtime-path diagnostics |
@@ -171,52 +164,49 @@ crates/
 Threading model: Tokio only at transport boundaries; dedicated synchronous OS
 threads own storage. Transactions, cursors, and borrowed records never cross an
 `.await`. One application-level writer with bounded queues; worker pools
-per stage (`numThreads.*`) with connections hashed onto workers like C++
-`ThreadPool`.
+per stage (`numThreads.*`) with connections hashed onto workers.
 
 ## Benchmarks
 
-We compared **Wok's optimized RocksDB candidate** with **strfry 1.1.3** over
-WebSocket on separate relay/load hosts with identical generated histories of
-15 million signed events of kinds 1 and 7. Runs offered 1,000 queries/second
-alongside 1,000 or 4,000 writes/second. Queries covered exact IDs, author history,
-500-author feeds and tags. Each rate was repeated with reversed relay order:
-ten minutes at 1,000 writes/second and five at 4,000. Checks verified bodies,
-ordering, completion and readback of every accepted write.
+We tested Wok RocksDB and strfry over WebSocket during sustained writes on
+separate relay and load VMs, starting with 15 million generated, signed events
+of kinds 1 and 7.
+Queries covered IDs, author history, 500-author feeds and tags at 1,000
+queries/second. Each write rate ran twice with reversed relay order: ten
+minutes at 1,000 writes/second and five at 4,000. Later fastr runs used the
+same workload. All three completed **1.8 million reads and 3.6 million
+writes**, with event bodies, ordering and accepted-write readback checked.
 
-Four later **fastr** runs covered the same workload and 16 query cases. fastr
-used buffered write acknowledgments without an fsync barrier; its write latency
-has a different durability guarantee.
+**p99 latency, in milliseconds** (lower is better). Read ranges cover all
+query shapes and write rates; each range spans trial percentiles without pooling.
 
-| Measurement | Wok RocksDB | strfry | fastr (buffered ACKs, later runs) |
+| Relay | Reads | Writes: 1k/s | Writes: 4k/s |
 | --- | ---: | ---: | ---: |
-| Timed reads completed / offered | 1.8M / 1.8M | 1.8M / 1.8M | 1.8M / 1.8M |
-| Timed writes accepted / offered | 3.6M / 3.6M | 3.6M / 3.6M | 3.6M / 3.6M |
-| Read p99, across all query shapes and write rates | 3.2–7.9 ms | 7.2–11.9 ms | 52.2 ms–20.3 s |
-| Write p99 at 1,000 writes/second | 9.1 ms | 150.4–159.5 ms | 266.9–269.2 s |
-| Write p99 at 4,000 writes/second | 43.2–46.9 ms | 430.5–3,724.0 ms | 227.0–227.1 s |
-| Read p99.9 at 4,000 writes/second, second repetition | 83.3–86.0 ms | 13.6–16.0 ms | 83.9–85.7 ms |
+| Wok RocksDB | 3.2–7.9 | 9.1 | 43.2–46.9 |
+| strfry 1.1.3 | 7.2–11.9 | 150.4–159.5 | 430.5–3,724.0 |
+| fastr | 52.2–20,300 | 266,900–269,200 | 227,000–227,100 |
 
-Latency runs from scheduled arrival to EOSE/acknowledgement, including client
-and network delay. Ranges span individual trial percentiles without pooling.
-fastr accumulated queues under sustained mixed traffic; its seconds-long values
-include waiting before send. Wok reduced read p99 versus strfry by **34–61% in
-all 16 matched cases**, with a worse rare read tail in one run. Finite,
-prewarmed runs do not establish maximum capacity
-or equal power-loss durability. Writers used different authors from the queries.
-A separate one-hour correctness soak checked 500-author latest feeds between
-write batches, live delivery, restart and acknowledged-write
-process-crash recovery.
+Latency includes queueing, client and network delay, from scheduled arrival to
+EOSE or write acknowledgement. fastr accumulated queues and acknowledged buffered
+writes without an fsync barrier; its durability guarantee differs.
+Wok's read p99 was **34–61% lower than strfry across all 16 matched cases**,
+but its rare read tail (p99.9) was worse in one run at 4,000 writes/second.
 
-Later attempts stopped before timed tests and remain unranked:
+These finite, prewarmed runs used different authors for writes and queries.
+They establish neither maximum capacity nor equal power-loss durability.
+A separate one-hour correctness soak checked latest feeds between write batches,
+live delivery, restart and acknowledged-write process-crash recovery.
 
-| Relay | Corpus offered | Qualification outcome |
+Two later attempts stopped before timed traffic and remain **unranked**:
+
+| Relay | Events offered | Outcome |
 | --- | ---: | --- |
-| nostr-rs-relay 0.10.0 | 15 million events | Stored history verified; historical-query preflight exceeded 120 seconds. |
-| Nostream 3.14.0 (native) | First 12,000 events | Importer reported 10,800 inserted and 1,200 errors. |
+| nostr-rs-relay 0.10.0 | 15 million | Preflight timeout (120 s) |
+| Nostream 3.14.0 (native) | 12,000 | 1,200 import errors |
 
-Sampled Nostream errors rejected reactions without target tags (`e`/`a`), which
-the synthetic kind-7 events lack.
+nostr-rs-relay's stored history passed verification before preflight. Nostream's
+importer reported 10,800 inserted; sampled errors rejected reactions missing
+target tags (`e`/`a`), which the synthetic kind-7 events lack.
 
 Results describe the measured RocksDB candidate at
 [`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8)
@@ -242,47 +232,10 @@ Build requirements and full-state upgrades: [RocksDB migration guide](docs/migra
 Harness and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 NIP-50 design, semantics, and search workload: [docs/nip50-search.md](docs/nip50-search.md).
 
-## Differences from strfry
-
-Full list with rationale: **[docs/known-differences.md](docs/known-differences.md)**.
-Summary:
-
-**wok extensions**
-- Unix socket transport (disabled by default).
-- `wok event <levId>` prints one event by local event ID.
-
-**Intentional Wok behavior**
-- Restricted-read REQ/NEG-OPEN requires a *completed* NIP-42 auth (C++ only
-  checks a session exists); `SetAuth` is dispatched to the negentropy worker
-  (C++ defines but never dispatches it); one AUTH challenge per session
-  vacancy (C++ re-sends an unstored challenge that can never succeed).
-- Historical restricted-kind REQ filtering uses the PackedEvent from the Event
-  table (C++ `RelayReqWorker` currently views EventPayload bytes).
-- JSON nesting capped at 128 levels (DoS hardening; tao has no limit).
-- New Wok databases use a Wok-owned v5 marker. strfry v3 is accepted only by
-  `wok migrate strfry`.
-- `wok` creates a missing database directory for new Wok databases.
-- NIP-11 `software` string is wok's repo URL.
-
-**Compatibility is deliberately bounded**
-- Migration preserves logical event records and validates their fingerprints;
-  Wok does not promise an LMDB file that strfry can reopen.
-- Existing strfry-like JSON serialization remains where it affects event IDs or
-  lossless migration. Other inherited quirks are candidates for correction.
-- Supported config settings are translated into strict Wok TOML. Review
-  external plugin, policy, and socket paths; unsupported strfry keys are not
-  carried forward.
-
-**Remaining gaps**
-- Mesh *client* links (router/sync) don't offer permessage-deflate
-  (tungstenite client limitation; bandwidth only). The wok *server* speaks
-  deflate like C++.
-
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Migration from strfry](docs/migration-from-strfry.md)
-- [Compatibility policy](docs/compatibility-policy.md)
 - [strfry LMDB v3 import contract](docs/lmdb-v3.md)
 - [Unix socket protocol](docs/unix-socket.md)
 - [Supported NIPs](docs/nips.md)
@@ -296,7 +249,6 @@ Summary:
 - [Security](docs/security.md)
 - [Reliability validation and CI gates](docs/reliability.md)
 - [Local and two-VM load lab](docs/load-lab.md)
-- [Known differences](docs/known-differences.md)
 
 ## Development
 
@@ -305,7 +257,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test -p wok-compat --test nip_conformance --test e2e_transports
-# Optional C++ differential (requires a strfry binary):
+# Optional import/interop regression tests (requires a strfry binary):
 cargo test -p wok-db --test cpp_roundtrip
 cargo test -p wok-compat --test cpp_export --test cpp_negentropy
 ```
@@ -322,7 +274,7 @@ target and scheduled sanitizer workflow are documented in
 [GNU Affero General Public License v3.0 or later](LICENSE)
 (`AGPL-3.0-or-later`).
 
-wok is an independent Rust implementation compatible with
+Wok began as an independent Rust reimplementation of
 [strfry](https://github.com/hoytech/strfry) by Doug Hoyte, which is GPL-3.0.
 The Nostr protocol is documented by the
 [nostr-protocol/nips](https://github.com/nostr-protocol/nips) repository.

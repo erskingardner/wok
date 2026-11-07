@@ -105,8 +105,8 @@ corpus needs, where that is more than strfry's defaults.
 
 Where a `limit` cuts through a second, a reply may hold any of that
 second's events. NIP-01 says the lowest id comes first, but strfry and Wok
-send a second's events in arrival order
-([known-differences.md](known-differences.md)). This holds for every mix.
+send a second's events in arrival order (see [event ordering](nips.md)).
+This holds for every mix.
 
 `ws_query_latency` takes turns between the archive reads of #226 scenario
 B:

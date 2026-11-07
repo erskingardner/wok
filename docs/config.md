@@ -393,7 +393,7 @@ may keep open. All reload live and are on the dashboard.
 | `relay.filter_validation.require_scoped_filters` | `false` | Enumeration: every filter must name `ids`, `authors`, or a tag filter (`#x` or `&x`), with any number of values. Refuses `{"kinds":[445]}`, `{"since":…}` or a bare `search`. On in `marmot`. | — | — |
 | `relay.filter_validation.max_kinds_per_filter` | `0` | The kinds one filter may list; `0` is unlimited. | Clients that ask for many kinds at once are refused. MDK's directory batches list six. | — |
 | `relay.filter_validation.allowed_kinds` | empty | The kinds a filter may list, comma-separated; empty allows any. A filter without `kinds` is not checked. | Queries for other kinds are refused, even when the relay stores them. | — |
-| `relay.filter_validation.require_author_or_tag` | `false` | strfry's rule: every filter must name exactly one author, `#p` or `#e` value. | — (on, it refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches; prefer `require_scoped_filters`.) | — |
+| `relay.filter_validation.require_author_or_tag` | `false` | Require every filter to name exactly one author, `#p` or `#e` value. | — (on, it refuses Marmot's `#h` group filters, `ids` fetches and multi-author outbox and directory batches; prefer `require_scoped_filters`.) | — |
 
 A REQ that would take the connection over its filter budget is refused with
 `CLOSED` and `blocked: this connection's filters exceed <budget> bytes`.
@@ -831,7 +831,7 @@ Restart settings, unless noted, and file-only.
 | `relay.frame_read_timeout_secs` | `30` | Longest idle gap between socket reads while a partial WebSocket frame or unfinished fragmented message is buffered (slow-trickle guard); zero disables it. Live, for new connections. |
 | `relay.message_read_timeout_secs` | `120` | Longest a WebSocket message or control frame may take to arrive, from its first byte to its last, so a client that sends a little at a time within the frame gap cannot keep a message buffered for long; zero disables it. A pause while the relay does not read, because the connection's hold is full, does not count. 120 seconds lets a 2 MiB message arrive at about 140 kbit/s. Live, for new connections. |
 | `relay.nodeinfo_enabled` | `false` | Serve [NodeInfo](https://nodeinfo.diaspora.software/) at `/.well-known/nodeinfo` and `/nodeinfo/2.1`, for fediverse-style crawlers; no Nostr client uses it, and NIP-11 carries the same software and version. Off: both paths answer 404. Discovery links to `/nodeinfo/2.1` on the origin of `relay.auth.service_url` (`wss` read as `https`), or else `admin.public_url`, never the request's `Host` header; with neither set it answers 404, and the relay and `wok doctor` warn. Live. |
-| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. Off in `marmot`. The relay accepts the first offer it can honour and declines one asking for a `server_max_window_bits` below 15 (see [known differences](known-differences.md)). A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
+| `relay.compression_enabled` | `true` | Enable permessage-deflate negotiation. Off in `marmot`. The relay accepts the first offer it can honour and declines one asking for a `server_max_window_bits` below 15. A compressed message may inflate to half of `relay.max_websocket_payload_size` plus 64 KiB, and past that to at most 32 times its compressed size, never past the maximum. |
 | `relay.compression_sliding_window` | `true` | Reuse compression context between messages, except on a connection whose client offered `server_no_context_takeover`. With context takeover, a connection's compressor can reference bytes from previous messages, the precondition for CRIME/BREACH-style oracles when secret and attacker-influenced bytes share a compression context. Relay traffic is essentially all public data, so practical impact is nil for most operators; if you serve auth-bearing or otherwise secret traffic over the same client connections, prefer `false`. |
 | `relay.ingester_threads` | `3` | Event-ingestion worker count. |
 | `relay.req_worker_threads` | `3` | Historical query worker count. |
@@ -1002,7 +1002,7 @@ and `restrict_read_to_involved_pubkey` chose how they were restricted:
 - **`restrict_read_to_involved_pubkey = false`** is no longer supported. It
   skipped the per-event check, so a REQ that mixed in another kind, such as
   `[{"kinds":[1]},{"kinds":[1059]}]`, returned the restricted kinds without
-  AUTH (strfry's behavior). Its kinds, from `restricted_read_kinds` or the
+  AUTH. Its kinds, from `restricted_read_kinds` or the
   preset, become `authenticated_kinds`, which any authenticated connection
   may read and no other can, and `recipient_only_kinds` becomes empty.
 

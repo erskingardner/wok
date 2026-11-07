@@ -1,6 +1,6 @@
 # Unix socket protocol
 
-Wok extension. Disabled by default. Not a C++ strfry feature.
+An optional local transport for Nostr messages, disabled by default.
 
 ## Framing
 

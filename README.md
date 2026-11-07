@@ -197,26 +197,12 @@ They establish neither maximum capacity nor equal power-loss durability.
 A separate one-hour correctness soak checked latest feeds between write batches,
 live delivery, restart and acknowledged-write process-crash recovery.
 
-Two later attempts stopped before timed traffic and remain **unranked**:
-
-| Relay | Events offered | Outcome |
-| --- | ---: | --- |
-| nostr-rs-relay 0.10.0 | 15 million | Preflight timeout (120 s) |
-| Nostream 3.14.0 (native) | 12,000 | 1,200 import errors |
-
-nostr-rs-relay's stored history passed verification before preflight. Nostream's
-importer reported 10,800 inserted; sampled errors rejected reactions missing
-target tags (`e`/`a`), which the synthetic kind-7 events lack.
-
 Results describe the measured RocksDB candidate at
 [`11fdf70`](https://github.com/erskingardner/wok/commit/11fdf700a9099aa7c8b0af357cce45832bf6c5c8)
 and fastr at
 [`bdbc0bc`](https://github.com/arx-ccn/fastr/commit/bdbc0bc053ad66df444eb47a02aa468e0109775d),
 before the single-runtime release preparation; they do not measure every later
-release change. The later attempts used nostr-rs-relay
-[`b5c1f64`](https://github.com/scsibug/nostr-rs-relay/commit/b5c1f642e4f4c3b9c54f5d18d66f4c53642076b4)
-and Nostream
-[`44f2e7b`](https://github.com/Cameri/nostream/commit/44f2e7b1cbc1c47acd469bdb62ad49713f16d552).
+release change.
 [Earlier comparison evidence and limits](https://github.com/erskingardner/wok/pull/294)
 · [Matched campaign instructions](https://github.com/erskingardner/wok/tree/master/tools/relay-matched).
 
